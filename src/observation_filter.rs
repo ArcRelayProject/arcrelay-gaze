@@ -25,9 +25,9 @@ impl Default for ObservationFilterConfig {
         Self {
             gaze_min_cutoff_hz: 1.35,
             gaze_beta: 0.55,
-            head_min_cutoff_hz: 1.1,
-            head_beta: 0.025,
-            geometry_min_cutoff_hz: 1.0,
+            head_min_cutoff_hz: 0.8,
+            head_beta: 0.02,
+            geometry_min_cutoff_hz: 0.85,
             geometry_beta: 0.002,
             confidence_min_cutoff_hz: 1.6,
             derivative_cutoff_hz: 1.0,
@@ -144,6 +144,9 @@ struct OneEuro {
     filtered_derivative: Option<f32>,
     last_raw: Option<f32>,
     last_at: Option<Instant>,
+    raw_window: [f32; 3],
+    raw_count: usize,
+    raw_cursor: usize,
 }
 
 impl OneEuro {
@@ -159,6 +162,7 @@ impl OneEuro {
             *self = Self::default();
             return raw;
         }
+        let raw = self.median_prefilter(raw);
         let (Some(previous_raw), Some(previous_at), Some(previous_filtered)) =
             (self.last_raw, self.last_at, self.filtered)
         else {
@@ -186,6 +190,18 @@ impl OneEuro {
         self.last_raw = Some(raw);
         self.last_at = Some(at);
         filtered
+    }
+
+    fn median_prefilter(&mut self, raw: f32) -> f32 {
+        self.raw_window[self.raw_cursor] = raw;
+        self.raw_cursor = (self.raw_cursor + 1) % self.raw_window.len();
+        self.raw_count = (self.raw_count + 1).min(self.raw_window.len());
+        if self.raw_count < self.raw_window.len() {
+            return raw;
+        }
+        let mut sorted = self.raw_window;
+        sorted.sort_by(f32::total_cmp);
+        sorted[1]
     }
 }
 
@@ -419,6 +435,23 @@ mod tests {
         let second = filter.update(closed, started + Duration::from_millis(132));
         assert!(first.left_eye_open);
         assert!(!second.left_eye_open);
+    }
+
+    #[test]
+    fn rejects_a_single_frame_head_pose_outlier() {
+        let started = Instant::now();
+        let mut filter = ObservationFilter::new(ObservationFilterConfig::default());
+        for index in 0..8 {
+            filter.update(
+                observation(0.0, 2.0),
+                started + Duration::from_millis(index * 66),
+            );
+        }
+        let outlier = filter.update(
+            observation(0.0, 70.0),
+            started + Duration::from_millis(8 * 66),
+        );
+        assert!(outlier.head_pose.yaw < 8.0);
     }
 
     fn range(values: &[f32]) -> f32 {

@@ -57,6 +57,9 @@ impl WorkspaceMapper {
     }
 
     pub fn map(&self, observation: &GazeObservation) -> Result<Option<GazeTarget>> {
+        if !self.profile.head_regions.is_empty() {
+            return self.map_head_region(observation);
+        }
         if !observation.usable_for_targeting() && !observation.usable_for_head_targeting() {
             return Ok(None);
         }
@@ -113,6 +116,36 @@ impl WorkspaceMapper {
             },
         }))
     }
+
+    fn map_head_region(&self, observation: &GazeObservation) -> Result<Option<GazeTarget>> {
+        let Some((region, region_confidence)) = self.profile.classify_head_region(observation)
+        else {
+            return Ok(None);
+        };
+        let display = self
+            .layout
+            .displays
+            .values()
+            .find(|display| display.display_id.as_str() == region.display_id)
+            .ok_or_else(|| {
+                Error::Mapping(format!(
+                    "calibrated display {} is missing from the workspace",
+                    region.display_id
+                ))
+            })?;
+        let point = display_center(display);
+        let logical = display.logical_point_from_desk(point);
+        Ok(Some(GazeTarget {
+            device_id: display.device_id.to_string(),
+            display_id: display.display_id.to_string(),
+            desk_x_um: point.x,
+            desk_y_um: point.y,
+            logical_x: logical.x,
+            logical_y: logical.y,
+            confidence: (observation.face_confidence * region_confidence).clamp(0.0, 0.85),
+            source: TargetingSource::HeadFallback,
+        }))
+    }
 }
 
 fn contains(display: &DisplaySurface, point: DeskPointUm) -> bool {
@@ -147,7 +180,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{HeadPose, Point, Rect, Vec3};
+    use crate::{HeadPose, HeadRegionProfile, Point, Rect, Vec3};
 
     fn layout() -> WorkspaceLayout {
         let display_id = DisplayId::parse("local-display").unwrap();
@@ -240,6 +273,7 @@ mod tests {
             head_coefficients_x: None,
             head_coefficients_y: None,
             head_rms_error_um: None,
+            head_regions: Vec::new(),
         };
         let target = WorkspaceMapper::new(layout, profile)
             .unwrap()
@@ -267,6 +301,7 @@ mod tests {
             head_coefficients_x: Some([300_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             head_coefficients_y: Some([170_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             head_rms_error_um: Some(20_000.0),
+            head_regions: Vec::new(),
         };
         let mut observation = observation();
         observation.left_eye_open = false;
@@ -284,6 +319,58 @@ mod tests {
     }
 
     #[test]
+    fn head_region_profile_ignores_eye_gaze_and_selects_screen_center() {
+        let mut layout = layout();
+        let mut right = layout.displays.values().next().unwrap().clone();
+        right.display_id = DisplayId::parse("right-display").unwrap();
+        right.device_id = ServiceInstanceId::parse("right-device").unwrap();
+        right.fingerprint = DisplayFingerprint::parse("panel-b").unwrap();
+        right.name = "Right".into();
+        right.logical_bounds.x = 1920.0;
+        right.desk_rect_um.x = 600_000;
+        layout.displays.insert(right.display_id.clone(), right);
+        let profile = CalibrationProfile {
+            version: 3,
+            camera_id: "camera".into(),
+            layout_signature: layout_signature(&layout),
+            coefficients_x: [0.0; 8],
+            coefficients_y: [0.0; 8],
+            rms_error_um: 0.0,
+            sample_count: 18,
+            eye_sample_count: Some(0),
+            head_coefficients_x: None,
+            head_coefficients_y: None,
+            head_rms_error_um: None,
+            head_regions: vec![
+                HeadRegionProfile {
+                    display_id: "local-display".into(),
+                    centroid: [-0.48, 0.0, 0.48, 0.5, 0.19],
+                    scale: [0.07, 0.07, 0.03, 0.03, 0.02],
+                    sample_count: 9,
+                },
+                HeadRegionProfile {
+                    display_id: "right-display".into(),
+                    centroid: [0.52, 0.0, 0.48, 0.5, 0.19],
+                    scale: [0.07, 0.07, 0.03, 0.03, 0.02],
+                    sample_count: 9,
+                },
+            ],
+        };
+        let mut observation = observation();
+        observation.gaze.x = -0.8;
+        observation.head_pose.yaw = 42.0;
+        let target = WorkspaceMapper::new(layout, profile)
+            .unwrap()
+            .map(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.display_id, "right-display");
+        assert_eq!(target.device_id, "right-device");
+        assert!((target.logical_x - 2_880.0).abs() < 0.1);
+        assert_eq!(target.source, TargetingSource::HeadFallback);
+    }
+
+    #[test]
     fn invalidates_profile_when_layout_changes() {
         let layout = layout();
         let profile = CalibrationProfile {
@@ -298,6 +385,7 @@ mod tests {
             head_coefficients_x: None,
             head_coefficients_y: None,
             head_rms_error_um: None,
+            head_regions: Vec::new(),
         };
         assert!(matches!(
             WorkspaceMapper::new(layout, profile),

@@ -16,7 +16,7 @@ mod smoothing;
 mod tracker;
 mod types;
 
-pub use calibration::{CalibrationProfile, CalibrationSample, Calibrator};
+pub use calibration::{CalibrationProfile, CalibrationSample, Calibrator, HeadRegionProfile};
 pub use error::{Error, Result};
 pub use mapping::{layout_signature, WorkspaceMapper};
 pub use observation_filter::ObservationFilterConfig;

@@ -117,8 +117,9 @@ impl GazeObservation {
             && self.head_pose.yaw.is_finite()
             && self.head_pose.pitch.is_finite()
             && self.head_pose.roll.is_finite()
-            && self.head_pose.yaw.abs() <= 55.0
-            && self.head_pose.pitch.abs() <= 40.0
+            && self.head_pose.yaw.abs() <= 80.0
+            && self.head_pose.pitch.abs() <= 60.0
+            && self.head_pose.roll.abs() <= 50.0
     }
 }
 

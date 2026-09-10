@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use arcrelay_input::DeskPointUm;
 use serde::{Deserialize, Serialize};
 
@@ -5,13 +7,27 @@ use crate::{Error, GazeObservation, Result};
 
 const FEATURE_COUNT: usize = 8;
 const HEAD_FEATURE_COUNT: usize = 7;
+const HEAD_REGION_FEATURE_COUNT: usize = 5;
 const MINIMUM_SAMPLES: usize = 9;
+const MINIMUM_REGION_SAMPLES: usize = 5;
 
 #[derive(Clone, Debug)]
 struct HeadCalibrationSample {
+    display_id: Option<String>,
     features: [f64; HEAD_FEATURE_COUNT],
+    region_features: [f64; HEAD_REGION_FEATURE_COUNT],
     desk_x_um: i64,
     desk_y_um: i64,
+}
+
+/// A calibrated head-pose cluster for one physical display.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadRegionProfile {
+    pub display_id: String,
+    pub centroid: [f64; HEAD_REGION_FEATURE_COUNT],
+    pub scale: [f64; HEAD_REGION_FEATURE_COUNT],
+    pub sample_count: usize,
 }
 
 /// One known point observed during calibration.
@@ -53,6 +69,8 @@ pub struct CalibrationProfile {
     pub head_coefficients_y: Option<[f64; HEAD_FEATURE_COUNT]>,
     #[serde(default)]
     pub head_rms_error_um: Option<f64>,
+    #[serde(default)]
+    pub head_regions: Vec<HeadRegionProfile>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,9 +129,43 @@ impl CalibrationProfile {
             source,
         ))
     }
+
+    pub(crate) fn classify_head_region(
+        &self,
+        observation: &GazeObservation,
+    ) -> Option<(&HeadRegionProfile, f32)> {
+        if self.head_regions.is_empty() || !observation.usable_for_head_targeting() {
+            return None;
+        }
+        let values = head_region_features(observation);
+        let mut ranked = self.head_regions.iter().map(|region| {
+            let distance = region_distance(region, &values);
+            (region, distance)
+        });
+        let (mut best_region, mut best_distance) = ranked.next()?;
+        let mut second_distance = f64::INFINITY;
+        for (region, distance) in ranked {
+            if distance < best_distance {
+                second_distance = best_distance;
+                best_region = region;
+                best_distance = distance;
+            } else if distance < second_distance {
+                second_distance = distance;
+            }
+        }
+        let separation = if second_distance.is_finite() {
+            ((second_distance - best_distance) / second_distance.max(1e-6)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let proximity = 1.0 / (1.0 + best_distance * 0.22);
+        let confidence = (proximity * (0.55 + separation * 0.45)).clamp(0.15, 0.9) as f32;
+        Some((best_region, confidence))
+    }
 }
 
-/// Accumulates screen points and fits a regularized affine/polynomial mapping.
+/// Accumulates screen points for legacy regression calibration or labelled
+/// head-direction samples for display-region calibration.
 #[derive(Clone, Debug)]
 pub struct Calibrator {
     camera_id: String,
@@ -134,17 +186,38 @@ impl Calibrator {
     }
 
     pub fn push(&mut self, observation: &GazeObservation, target: DeskPointUm) -> Result<()> {
+        self.push_inner(observation, target, None)
+    }
+
+    pub fn push_for_display(
+        &mut self,
+        observation: &GazeObservation,
+        target: DeskPointUm,
+        display_id: impl Into<String>,
+    ) -> Result<()> {
+        self.push_inner(observation, target, Some(display_id.into()))
+    }
+
+    fn push_inner(
+        &mut self,
+        observation: &GazeObservation,
+        target: DeskPointUm,
+        display_id: Option<String>,
+    ) -> Result<()> {
         if !observation.usable_for_head_targeting() {
             return Err(Error::Calibration(
                 "a confident face and usable head pose are required".into(),
             ));
         }
+        let region_calibration = display_id.is_some();
         self.head_samples.push(HeadCalibrationSample {
+            display_id,
             features: head_features(observation),
+            region_features: head_region_features(observation),
             desk_x_um: target.x,
             desk_y_um: target.y,
         });
-        if observation.usable_for_targeting() {
+        if !region_calibration && observation.usable_for_targeting() {
             self.samples
                 .push(CalibrationSample::from_observation(observation, target));
         }
@@ -181,8 +254,10 @@ impl Calibrator {
             &head_coefficients_y,
         );
         let rms_error_um = eye_rms_error_um.unwrap_or(head_rms_error_um);
+        let head_regions = build_head_regions(&self.head_samples)?;
+        let version = if head_regions.is_empty() { 2 } else { 3 };
         Ok(CalibrationProfile {
-            version: 2,
+            version,
             camera_id: self.camera_id,
             layout_signature: self.layout_signature,
             coefficients_x,
@@ -193,6 +268,7 @@ impl Calibrator {
             head_coefficients_x: Some(head_coefficients_x),
             head_coefficients_y: Some(head_coefficients_y),
             head_rms_error_um: Some(head_rms_error_um),
+            head_regions,
         })
     }
 }
@@ -230,6 +306,81 @@ fn head_features(observation: &GazeObservation) -> [f64; HEAD_FEATURE_COUNT] {
         yaw * pitch,
         f64::from(observation.face.width * observation.face.height) / (width * height),
     ]
+}
+
+fn head_region_features(observation: &GazeObservation) -> [f64; HEAD_REGION_FEATURE_COUNT] {
+    let center = observation.face.center();
+    let width = observation.frame_width.max(1) as f64;
+    let height = observation.frame_height.max(1) as f64;
+    [
+        f64::from(observation.head_pose.yaw) / 75.0,
+        f64::from(observation.head_pose.pitch) / 55.0,
+        f64::from(center.x) / width,
+        f64::from(center.y) / height,
+        f64::from(observation.face.width * observation.face.height) / (width * height),
+    ]
+}
+
+fn build_head_regions(samples: &[HeadCalibrationSample]) -> Result<Vec<HeadRegionProfile>> {
+    let mut groups: BTreeMap<&str, Vec<&HeadCalibrationSample>> = BTreeMap::new();
+    for sample in samples {
+        if let Some(display_id) = sample.display_id.as_deref().filter(|id| !id.is_empty()) {
+            groups.entry(display_id).or_default().push(sample);
+        }
+    }
+    let mut regions = Vec::with_capacity(groups.len());
+    for (display_id, samples) in groups {
+        if samples.len() < MINIMUM_REGION_SAMPLES {
+            return Err(Error::Calibration(format!(
+                "display {display_id} needs at least {MINIMUM_REGION_SAMPLES} head samples, got {}",
+                samples.len()
+            )));
+        }
+        let mut centroid = [0.0; HEAD_REGION_FEATURE_COUNT];
+        for sample in &samples {
+            for (index, value) in sample.region_features.iter().enumerate() {
+                centroid[index] += value;
+            }
+        }
+        for value in &mut centroid {
+            *value /= samples.len() as f64;
+        }
+        let mut scale = [0.0; HEAD_REGION_FEATURE_COUNT];
+        for sample in &samples {
+            for index in 0..HEAD_REGION_FEATURE_COUNT {
+                let delta = sample.region_features[index] - centroid[index];
+                scale[index] += delta * delta;
+            }
+        }
+        let floors = [0.055, 0.055, 0.025, 0.025, 0.012];
+        for index in 0..HEAD_REGION_FEATURE_COUNT {
+            scale[index] = (scale[index] / samples.len() as f64)
+                .sqrt()
+                .max(floors[index]);
+        }
+        regions.push(HeadRegionProfile {
+            display_id: display_id.to_owned(),
+            centroid,
+            scale,
+            sample_count: samples.len(),
+        });
+    }
+    Ok(regions)
+}
+
+fn region_distance(region: &HeadRegionProfile, values: &[f64; HEAD_REGION_FEATURE_COUNT]) -> f64 {
+    const WEIGHTS: [f64; HEAD_REGION_FEATURE_COUNT] = [3.0, 3.0, 1.2, 1.2, 0.4];
+    let weighted = values
+        .iter()
+        .zip(region.centroid)
+        .zip(region.scale)
+        .zip(WEIGHTS)
+        .map(|(((value, centroid), scale), weight)| {
+            let normalized = (value - centroid) / scale.max(1e-6);
+            normalized * normalized * weight
+        })
+        .sum::<f64>();
+    (weighted / WEIGHTS.iter().sum::<f64>()).sqrt()
 }
 
 fn fit(
@@ -384,7 +535,9 @@ mod tests {
         let head_samples = samples
             .iter()
             .map(|sample| HeadCalibrationSample {
+                display_id: None,
                 features: sample.features[..HEAD_FEATURE_COUNT].try_into().unwrap(),
+                region_features: [0.0; HEAD_REGION_FEATURE_COUNT],
                 desk_x_um: sample.desk_x_um,
                 desk_y_um: sample.desk_y_um,
             })
@@ -455,5 +608,86 @@ mod tests {
         assert_eq!(profile.eye_sample_count, Some(0));
         assert!(profile.rms_error_um.is_finite());
         serde_json::to_vec(&profile).expect("serialize head-only profile");
+    }
+
+    #[test]
+    fn builds_distinct_head_regions_for_each_display() {
+        let mut calibrator = Calibrator::new("camera", "layout");
+        for (display_id, base_yaw, desk_x) in [
+            ("left-display", -38.0, 200_000),
+            ("right-display", 41.0, 800_000),
+        ] {
+            for index in 0..9 {
+                let observation = GazeObservation {
+                    frame_width: 1280,
+                    frame_height: 720,
+                    face: crate::Rect {
+                        x: 430.0 + index as f32,
+                        y: 180.0,
+                        width: 260.0,
+                        height: 300.0,
+                    },
+                    face_confidence: 0.95,
+                    landmarks: Vec::new(),
+                    left_eye: crate::Rect::default(),
+                    right_eye: crate::Rect::default(),
+                    left_eye_open: true,
+                    right_eye_open: true,
+                    head_pose: crate::HeadPose {
+                        yaw: base_yaw + (index as f32 - 4.0) * 0.4,
+                        pitch: (index as f32 - 4.0) * 0.2,
+                        roll: 0.0,
+                    },
+                    gaze: crate::Vec3::default(),
+                    inference_ms: 4.0,
+                };
+                calibrator
+                    .push_for_display(
+                        &observation,
+                        DeskPointUm {
+                            x: desk_x,
+                            y: 180_000,
+                        },
+                        display_id,
+                    )
+                    .expect("accept display head sample");
+            }
+        }
+        let profile = calibrator.finish().expect("fit display regions");
+        assert_eq!(profile.version, 3);
+        assert_eq!(profile.head_regions.len(), 2);
+        assert_eq!(profile.eye_sample_count, Some(0));
+        let mut right = GazeObservation {
+            frame_width: 1280,
+            frame_height: 720,
+            face: crate::Rect {
+                x: 434.0,
+                y: 180.0,
+                width: 260.0,
+                height: 300.0,
+            },
+            face_confidence: 0.95,
+            landmarks: Vec::new(),
+            left_eye: crate::Rect::default(),
+            right_eye: crate::Rect::default(),
+            left_eye_open: false,
+            right_eye_open: false,
+            head_pose: crate::HeadPose {
+                yaw: 43.0,
+                pitch: 1.0,
+                roll: 0.0,
+            },
+            gaze: crate::Vec3::default(),
+            inference_ms: 4.0,
+        };
+        let (region, _) = profile
+            .classify_head_region(&right)
+            .expect("classify right display");
+        assert_eq!(region.display_id, "right-display");
+        right.head_pose.yaw = -42.0;
+        let (region, _) = profile
+            .classify_head_region(&right)
+            .expect("classify left display");
+        assert_eq!(region.display_id, "left-display");
     }
 }
