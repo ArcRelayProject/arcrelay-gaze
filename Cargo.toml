@@ -1,0 +1,36 @@
+[package]
+name = "arcrelay-gaze"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "AGPL-3.0-only"
+publish = false
+description = "Local-first gaze tracking and ArcRelay workspace targeting"
+repository = "https://gitea.czbrcj.cn/ArcRelay/arcrelay-gaze"
+
+[features]
+default = ["camera"]
+camera = ["dep:camera"]
+demo = ["camera", "dep:eframe"]
+
+[dependencies]
+arcrelay-input = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-input.git", rev = "09fb762cb3e12a358bb1b095858479ea5093a91e" }
+camera = { optional = true, git = "ssh://git@gitea.czbrcj.cn:9922/Medivh/camera-rs.git", rev = "bbd85232a1977d276f7282ed45d6a03c4786eb0b" }
+image = { version = "0.25", default-features = false }
+imageproc = "0.25"
+mnn-runtime = { git = "https://github.com/zibo-chen/mnn-runtime-rs", rev = "2d88f779744a9029859743db9a55b5d00a2622c8" }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+eframe = { version = "0.33", optional = true }
+
+[[example]]
+name = "egui_demo"
+required-features = ["demo"]
+
+[dev-dependencies]
+serde_json = "1"
