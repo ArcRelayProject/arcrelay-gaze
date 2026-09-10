@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "camera"
 version = "0.2.0"
-source = "git+ssh://git@gitea.czbrcj.cn:9922/Medivh/camera-rs.git?rev=bbd85232a1977d276f7282ed45d6a03c4786eb0b#bbd85232a1977d276f7282ed45d6a03c4786eb0b"
+source = "git+ssh://git@gitea.czbrcj.cn:9922/Medivh/camera-rs.git?rev=154c332370a7a4b457d188d0f81233bfcaa85e5c#154c332370a7a4b457d188d0f81233bfcaa85e5c"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -4014,7 +4014,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
