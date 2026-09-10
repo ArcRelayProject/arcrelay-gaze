@@ -63,6 +63,7 @@ impl CalibrationProfile {
 }
 
 /// Accumulates screen points and fits a regularized affine/polynomial mapping.
+#[derive(Clone, Debug)]
 pub struct Calibrator {
     camera_id: String,
     layout_signature: String,

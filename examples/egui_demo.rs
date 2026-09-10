@@ -131,10 +131,8 @@ impl DemoApp {
             .build()
             .map_err(|error| error.to_string())
             .and_then(|runtime| {
-                let tracker =
-                    GazeTracker::with_bundled_models(1).map_err(|error| error.to_string())?;
                 runtime
-                    .block_on(tracker.cameras())
+                    .block_on(GazeTracker::available_cameras())
                     .map_err(|error| error.to_string())
             });
         self.cameras = result.unwrap_or_else(|error| {

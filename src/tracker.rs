@@ -74,20 +74,13 @@ impl GazeTracker {
     }
 
     pub async fn cameras(&self) -> Result<Vec<CameraDescriptor>> {
-        self.camera_system
-            .devices()
-            .await
-            .map_err(Error::from)
-            .map(|devices| {
-                devices
-                    .into_iter()
-                    .map(|device| CameraDescriptor {
-                        id: device.id.to_string(),
-                        name: device.name,
-                        description: device.description,
-                    })
-                    .collect()
-            })
+        camera_descriptors(&self.camera_system).await
+    }
+
+    /// Enumerate cameras without loading any MNN model. Desktop settings use
+    /// this path so opening the device picker remains cheap and side-effect free.
+    pub async fn available_cameras() -> Result<Vec<CameraDescriptor>> {
+        camera_descriptors(&CameraSystem::new()).await
     }
 
     pub fn set_workspace_mapper(&self, mapper: Option<WorkspaceMapper>) {
@@ -248,6 +241,19 @@ impl GazeTracker {
             task: Some(task),
         })
     }
+}
+
+async fn camera_descriptors(system: &CameraSystem) -> Result<Vec<CameraDescriptor>> {
+    system.devices().await.map_err(Error::from).map(|devices| {
+        devices
+            .into_iter()
+            .map(|device| CameraDescriptor {
+                id: device.id.to_string(),
+                name: device.name,
+                description: device.description,
+            })
+            .collect()
+    })
 }
 
 /// Owns capture lifetime. Explicit stop waits for native camera cleanup.
