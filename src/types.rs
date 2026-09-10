@@ -110,6 +110,24 @@ impl GazeObservation {
             && self.gaze.y.is_finite()
             && self.gaze.z.is_finite()
     }
+
+    #[must_use]
+    pub fn usable_for_head_targeting(&self) -> bool {
+        self.face_confidence >= 0.6
+            && self.head_pose.yaw.is_finite()
+            && self.head_pose.pitch.is_finite()
+            && self.head_pose.roll.is_finite()
+            && self.head_pose.yaw.abs() <= 55.0
+            && self.head_pose.pitch.abs() <= 40.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TargetingSource {
+    #[default]
+    Eye,
+    HeadFallback,
 }
 
 /// A calibrated point on one ArcRelay display.
@@ -123,6 +141,8 @@ pub struct GazeTarget {
     pub logical_x: f64,
     pub logical_y: f64,
     pub confidence: f32,
+    #[serde(default)]
+    pub source: TargetingSource,
 }
 
 /// Target after temporal hysteresis and dwell filtering.

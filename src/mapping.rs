@@ -1,7 +1,8 @@
 use arcrelay_input::{DeskPointUm, DisplaySurface, WorkspaceLayout};
 use sha2::{Digest, Sha256};
 
-use crate::{CalibrationProfile, Error, GazeObservation, GazeTarget, Result};
+use crate::calibration::ProjectionSource;
+use crate::{CalibrationProfile, Error, GazeObservation, GazeTarget, Result, TargetingSource};
 
 /// Stable digest of the camera-relevant physical display arrangement.
 #[must_use]
@@ -56,20 +57,41 @@ impl WorkspaceMapper {
     }
 
     pub fn map(&self, observation: &GazeObservation) -> Result<Option<GazeTarget>> {
-        if !observation.usable_for_targeting() {
+        if !observation.usable_for_targeting() && !observation.usable_for_head_targeting() {
             return Ok(None);
         }
-        let point = self.profile.project(observation)?;
+        let (point, source) = self.profile.project_with_source(observation)?;
         let Some(display) = self
             .layout
             .displays
             .values()
             .find(|display| contains(display, point))
+            .or_else(|| {
+                (source == ProjectionSource::HeadFallback)
+                    .then(|| {
+                        self.layout.displays.values().min_by_key(|display| {
+                            let center = display_center(display);
+                            let dx = i128::from(center.x) - i128::from(point.x);
+                            let dy = i128::from(center.y) - i128::from(point.y);
+                            dx * dx + dy * dy
+                        })
+                    })
+                    .flatten()
+            })
         else {
             return Ok(None);
         };
+        let point = if source == ProjectionSource::HeadFallback {
+            display_center(display)
+        } else {
+            point
+        };
         let logical = display.logical_point_from_desk(point);
-        let error_scale = (1.0 / (1.0 + self.profile.rms_error_um / 50_000.0)) as f32;
+        let error_um = match source {
+            ProjectionSource::Eye => self.profile.rms_error_um,
+            ProjectionSource::HeadFallback => self.profile.head_rms_error_um.unwrap_or(150_000.0),
+        };
+        let error_scale = (1.0 / (1.0 + error_um / 50_000.0)) as f32;
         Ok(Some(GazeTarget {
             device_id: display.device_id.to_string(),
             display_id: display.display_id.to_string(),
@@ -77,7 +99,18 @@ impl WorkspaceMapper {
             desk_y_um: point.y,
             logical_x: logical.x,
             logical_y: logical.y,
-            confidence: (observation.face_confidence * error_scale).clamp(0.0, 1.0),
+            confidence: (observation.face_confidence * error_scale).clamp(
+                0.0,
+                if source == ProjectionSource::HeadFallback {
+                    0.65
+                } else {
+                    1.0
+                },
+            ),
+            source: match source {
+                ProjectionSource::Eye => TargetingSource::Eye,
+                ProjectionSource::HeadFallback => TargetingSource::HeadFallback,
+            },
         }))
     }
 }
@@ -88,6 +121,19 @@ fn contains(display: &DisplaySurface, point: DeskPointUm) -> bool {
         && point.x < rect.x.saturating_add(rect.width)
         && point.y >= rect.y
         && point.y < rect.y.saturating_add(rect.height)
+}
+
+fn display_center(display: &DisplaySurface) -> DeskPointUm {
+    DeskPointUm {
+        x: display
+            .desk_rect_um
+            .x
+            .saturating_add(display.desk_rect_um.width / 2),
+        y: display
+            .desk_rect_um
+            .y
+            .saturating_add(display.desk_rect_um.height / 2),
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +236,10 @@ mod tests {
             coefficients_y: [170_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             rms_error_um: 1_000.0,
             sample_count: 9,
+            eye_sample_count: None,
+            head_coefficients_x: None,
+            head_coefficients_y: None,
+            head_rms_error_um: None,
         };
         let target = WorkspaceMapper::new(layout, profile)
             .unwrap()
@@ -203,6 +253,37 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_head_direction_when_eye_gaze_is_unavailable() {
+        let layout = layout();
+        let profile = CalibrationProfile {
+            version: 2,
+            camera_id: "camera".into(),
+            layout_signature: layout_signature(&layout),
+            coefficients_x: [0.0; 8],
+            coefficients_y: [0.0; 8],
+            rms_error_um: f64::INFINITY,
+            sample_count: 9,
+            eye_sample_count: Some(0),
+            head_coefficients_x: Some([300_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            head_coefficients_y: Some([170_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            head_rms_error_um: Some(20_000.0),
+        };
+        let mut observation = observation();
+        observation.left_eye_open = false;
+        observation.right_eye_open = false;
+        observation.head_pose.yaw = 38.0;
+        let target = WorkspaceMapper::new(layout, profile)
+            .unwrap()
+            .map(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.source, TargetingSource::HeadFallback);
+        assert_eq!(target.display_id, "local-display");
+        assert!((target.logical_x - 960.0).abs() < 0.1);
+        assert!(target.confidence <= 0.65);
+    }
+
+    #[test]
     fn invalidates_profile_when_layout_changes() {
         let layout = layout();
         let profile = CalibrationProfile {
@@ -213,6 +294,10 @@ mod tests {
             coefficients_y: [0.0; 8],
             rms_error_um: 0.0,
             sample_count: 9,
+            eye_sample_count: None,
+            head_coefficients_x: None,
+            head_coefficients_y: None,
+            head_rms_error_um: None,
         };
         assert!(matches!(
             WorkspaceMapper::new(layout, profile),

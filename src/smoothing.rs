@@ -107,6 +107,7 @@ fn smooth(current: &mut GazeTarget, next: &GazeTarget, alpha: f64) {
     current.logical_x = blend(current.logical_x, next.logical_x);
     current.logical_y = blend(current.logical_y, next.logical_y);
     current.confidence = blend(f64::from(current.confidence), f64::from(next.confidence)) as f32;
+    current.source = next.source;
 }
 
 #[cfg(test)]
@@ -122,6 +123,7 @@ mod tests {
             logical_x: 1.0,
             logical_y: 2.0,
             confidence: 0.9,
+            source: crate::TargetingSource::Eye,
         }
     }
 

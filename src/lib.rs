@@ -23,6 +23,6 @@ pub use smoothing::{StabilizerConfig, TargetStabilizer};
 #[cfg(feature = "camera")]
 pub use tracker::{CameraDescriptor, GazeTracker, TrackerConfig, TrackerSession};
 pub use types::{
-    GazeObservation, GazeTarget, HeadPose, Point, Rect, StabilizedTarget, TrackerEvent,
-    TrackerSnapshot, TrackingState, Vec3,
+    GazeObservation, GazeTarget, HeadPose, Point, Rect, StabilizedTarget, TargetingSource,
+    TrackerEvent, TrackerSnapshot, TrackingState, Vec3,
 };
