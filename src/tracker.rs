@@ -9,10 +9,11 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
+use crate::observation_filter::ObservationFilter;
 use crate::{Error, ModelBundle};
 use crate::{
-    GazeEngine, Result, StabilizerConfig, TargetStabilizer, TrackerEvent, TrackerSnapshot,
-    TrackingState, WorkspaceMapper,
+    GazeEngine, ObservationFilterConfig, Result, StabilizerConfig, TargetStabilizer, TrackerEvent,
+    TrackerSnapshot, TrackingState, WorkspaceMapper,
 };
 
 /// Camera shown to the ArcRelay desktop UI.
@@ -32,6 +33,7 @@ pub struct TrackerConfig {
     pub fps: u32,
     pub inference_interval: Duration,
     pub include_preview: bool,
+    pub observation_filter: ObservationFilterConfig,
     pub stabilizer: StabilizerConfig,
 }
 
@@ -43,6 +45,7 @@ impl Default for TrackerConfig {
             fps: 30,
             inference_interval: Duration::from_millis(66),
             include_preview: false,
+            observation_filter: ObservationFilterConfig::default(),
             stabilizer: StabilizerConfig::default(),
         }
     }
@@ -138,6 +141,7 @@ impl GazeTracker {
         let events = event_tx.clone();
         let task = tokio::spawn(async move {
             let mut receiver = capture.subscribe();
+            let mut observation_filter = ObservationFilter::new(config.observation_filter);
             let mut stabilizer = TargetStabilizer::new(config.stabilizer);
             let mut last_inference = None;
             let mut snapshot = snapshot_tx.borrow().clone();
@@ -181,7 +185,7 @@ impl GazeTracker {
                             continue;
                         };
                         let inference_engine = engine.clone();
-                        let observation = match tokio::task::spawn_blocking(move || inference_engine.infer(&image)).await {
+                        let raw_observation = match tokio::task::spawn_blocking(move || inference_engine.infer(&image)).await {
                             Ok(Ok(observation)) => observation,
                             Ok(Err(error)) => {
                                 snapshot.state = TrackingState::Failed;
@@ -196,6 +200,9 @@ impl GazeTracker {
                                 break;
                             }
                         };
+                        let filtered_at = Instant::now();
+                        let observation = raw_observation
+                            .map(|observation| observation_filter.update(observation, filtered_at));
                         snapshot.inferred_frames = snapshot.inferred_frames.saturating_add(1);
                         snapshot.dropped_frames = receiver.dropped_frames();
                         snapshot.frame_width = layout.width;
@@ -205,7 +212,7 @@ impl GazeTracker {
                         let mapped = observation
                             .as_ref()
                             .and_then(|observation| mapper.read().as_ref().and_then(|mapper| mapper.map(observation).ok().flatten()));
-                        snapshot.target = stabilizer.update(mapped, now);
+                        snapshot.target = stabilizer.update(mapped, filtered_at);
                         snapshot.state = if observation.is_none() {
                             TrackingState::FaceLost
                         } else if mapper.read().is_none() {

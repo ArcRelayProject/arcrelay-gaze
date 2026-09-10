@@ -9,6 +9,7 @@ mod error;
 mod image_ops;
 mod mapping;
 mod model;
+mod observation_filter;
 mod pipeline;
 mod smoothing;
 #[cfg(feature = "camera")]
@@ -18,6 +19,7 @@ mod types;
 pub use calibration::{CalibrationProfile, CalibrationSample, Calibrator};
 pub use error::{Error, Result};
 pub use mapping::{layout_signature, WorkspaceMapper};
+pub use observation_filter::ObservationFilterConfig;
 pub use pipeline::{GazeEngine, ModelBundle};
 pub use smoothing::{StabilizerConfig, TargetStabilizer};
 #[cfg(feature = "camera")]
