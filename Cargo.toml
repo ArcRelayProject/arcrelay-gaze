@@ -14,7 +14,7 @@ camera = ["dep:camera"]
 demo = ["camera"]
 
 [dependencies]
-arcrelay-input = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-input.git", rev = "1114b32ec72c0e9ce93fca61e6d215c173f54e9d" }
+arcrelay-input = { version = "0.1.0", git = "https://gitea.czbrcj.cn/ArcRelay/arcrelay-input.git", rev = "2987fb9692865f63516949f1028cfd70895d134d" }
 camera = { optional = true, git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
 image = { version = "0.25", default-features = false }
 imageproc = "0.25"
