@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use mnn_runtime::{Model, Runtime, Tensor};
 
 use crate::{Error, Result};
@@ -10,9 +12,12 @@ pub(crate) struct MnnModel {
 
 impl MnnModel {
     pub(crate) fn load(runtime: &Runtime, name: &str, bytes: &[u8]) -> Result<Self> {
-        let model = runtime
-            .load_bytes(bytes.to_vec())
-            .map_err(|error| Error::Model(format!("load {name}: {error}")))?;
+        let started = Instant::now();
+        tracing::info!(model = name, bytes = bytes.len(), "loading MNN model");
+        let model = runtime.load_bytes(bytes.to_vec()).map_err(|error| {
+            tracing::error!(model = name, %error, "failed to load MNN model");
+            Error::Model(format!("load {name}: {error}"))
+        })?;
         let inputs = model.info().inputs();
         if inputs.len() != 1 {
             return Err(Error::Model(format!(
@@ -31,6 +36,12 @@ impl MnnModel {
         let input_shape = input
             .concrete_shape()
             .map_err(|error| Error::Model(format!("resolve {name} input: {error}")))?;
+        tracing::info!(
+            model = name,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ?input_shape,
+            "loaded MNN model"
+        );
         Ok(Self {
             model,
             input_name,
