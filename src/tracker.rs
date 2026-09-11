@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,7 @@ pub struct GazeTracker {
     presence_profile: Arc<RwLock<Option<PresenceProfile>>>,
     presence_enrollment: Arc<Mutex<Option<PresenceEnrollment>>>,
     completed_presence_profile: Arc<Mutex<Option<PresenceProfile>>>,
+    preview_enabled: Arc<AtomicBool>,
 }
 
 impl GazeTracker {
@@ -75,6 +77,7 @@ impl GazeTracker {
             presence_profile: Arc::new(RwLock::new(None)),
             presence_enrollment: Arc::new(Mutex::new(None)),
             completed_presence_profile: Arc::new(Mutex::new(None)),
+            preview_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -125,6 +128,12 @@ impl GazeTracker {
 
     pub fn take_completed_presence_profile(&self) -> Option<PresenceProfile> {
         self.completed_presence_profile.lock().take()
+    }
+
+    /// Enable or disable in-memory preview frames without restarting capture.
+    /// Preview pixels remain process-local and are never persisted by this crate.
+    pub fn set_preview_enabled(&self, enabled: bool) {
+        self.preview_enabled.store(enabled, Ordering::Release);
     }
 
     pub async fn start(&self, camera_id: &str, config: TrackerConfig) -> Result<TrackerSession> {
@@ -178,6 +187,7 @@ impl GazeTracker {
         let presence_profile = self.presence_profile.clone();
         let presence_enrollment = self.presence_enrollment.clone();
         let completed_presence_profile = self.completed_presence_profile.clone();
+        let preview_enabled = self.preview_enabled.clone();
         let events = event_tx.clone();
         let task = tokio::spawn(async move {
             let mut receiver = capture.subscribe();
@@ -218,7 +228,9 @@ impl GazeTracker {
                         last_inference = Some(now);
                         let layout = frame.layout();
                         let pixels = frame.bytes().to_vec();
-                        let preview = config.include_preview.then(|| Arc::<[u8]>::from(pixels.clone()));
+                        let preview = (config.include_preview
+                            || preview_enabled.load(Ordering::Acquire))
+                        .then(|| Arc::<[u8]>::from(pixels.clone()));
                         let Some(image) = RgbImage::from_raw(layout.width, layout.height, pixels) else {
                             snapshot.state = TrackingState::Failed;
                             snapshot.error = Some("camera returned an invalid RGB frame".into());
