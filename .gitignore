@@ -1,3 +1,3 @@
 /target/
 *.mnncache
-
+/models/*.mnn

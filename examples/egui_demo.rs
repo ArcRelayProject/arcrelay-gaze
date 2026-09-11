@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -37,7 +38,7 @@ impl CameraWorker {
                 }
             };
             runtime.block_on(async move {
-                let tracker = match GazeTracker::with_bundled_models(threads) {
+                let tracker = match GazeTracker::from_model_directory(&model_directory(), threads) {
                     Ok(tracker) => tracker,
                     Err(error) => {
                         let _ = sender.send(WorkerEvent::Error(error.to_string()));
@@ -375,7 +376,9 @@ impl Drop for DemoApp {
 fn main() -> eframe::Result<()> {
     let arguments = std::env::args().collect::<Vec<_>>();
     if arguments.iter().any(|argument| argument == "--self-test") {
-        match arcrelay_gaze::GazeEngine::bundled(4).and_then(|engine| engine.self_test()) {
+        match arcrelay_gaze::GazeEngine::from_model_directory(&model_directory(), 4)
+            .and_then(|engine| engine.self_test())
+        {
             Ok(report) => {
                 println!("MNN gaze pipeline self-test passed");
                 for line in report {
@@ -418,7 +421,8 @@ fn run_camera_test(requested_id: Option<&str>) -> Result<(), String> {
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
-        let tracker = GazeTracker::with_bundled_models(4).map_err(|error| error.to_string())?;
+        let tracker = GazeTracker::from_model_directory(&model_directory(), 4)
+            .map_err(|error| error.to_string())?;
         let cameras = tracker.cameras().await.map_err(|error| error.to_string())?;
         let camera = requested_id
             .and_then(|id| cameras.iter().find(|camera| camera.id == id))
@@ -462,4 +466,10 @@ fn run_camera_test(requested_id: Option<&str>) -> Result<(), String> {
         );
         Ok(())
     })
+}
+
+fn model_directory() -> PathBuf {
+    std::env::var_os("ARCRELAY_GAZE_MODEL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("models"))
 }

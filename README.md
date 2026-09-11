@@ -16,23 +16,38 @@ The implementation follows four layers that can be tested independently:
 4. `TargetStabilizer`: dwell, display hysteresis and loss grace used by Arc Input's safe
    gaze-preselection policy. Physical mouse or keyboard activity remains the confirmation signal.
 
+## Model bundle
+
+Production builds never embed model bytes in an executable. Download and extract the architecture-
+independent `arcrelay-gaze-models-v1.0.0.zip` asset from the
+[`gaze-models-v1.0.0`](https://github.com/ArcRelayProject/arcrelay/releases/tag/gaze-models-v1.0.0)
+GitHub release, then set `ARCRELAY_GAZE_MODEL_DIR` to that directory. The loader checks every size
+and SHA-256 value before creating an MNN model.
+
+Camera capture is also target-specific: AVFoundation on Apple platforms, Media Foundation on
+Windows, V4L2 on Linux, and Camera2 on Android. The dependency disables `camera-rs` defaults so
+production builds do not include fallback UVC or unrelated platform backends.
+
 ## Run the standalone demo
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo
+ARCRELAY_GAZE_MODEL_DIR=/path/to/models \
+  CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo
 ```
 
 Use `--self-test` to execute all six bundled MNN graphs without opening a camera:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo -- --self-test
+ARCRELAY_GAZE_MODEL_DIR=/path/to/models \
+  CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo -- --self-test
 ```
 
 Use `--camera-test` for a bounded 20-inference smoke test. It selects the first camera unless a
 `camera-rs` device ID follows the flag:
 
 ```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo -- --camera-test
+ARCRELAY_GAZE_MODEL_DIR=/path/to/models \
+  CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo -- --camera-test
 ```
 
 The demo deliberately uses the public library API. It is therefore also an integration test for
@@ -49,5 +64,6 @@ the `camera-rs` adapter rather than a second capture implementation.
 
 ## Models and licensing
 
-See [models/README.md](models/README.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-The Rust source is licensed under AGPL-3.0-only. Bundled model files retain their upstream terms.
+See [models/README.md](models/README.md), [model-bundle-manifest.json](model-bundle-manifest.json),
+and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The Rust source is licensed under
+AGPL-3.0-only. Downloadable model files retain their upstream terms.

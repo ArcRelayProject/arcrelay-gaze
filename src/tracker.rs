@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,12 +82,14 @@ impl GazeTracker {
         }
     }
 
-    pub fn with_bundled_models(threads: usize) -> Result<Self> {
-        Ok(Self::new(GazeEngine::bundled(threads)?))
+    pub fn from_model_directory(directory: &Path, threads: usize) -> Result<Self> {
+        Ok(Self::new(GazeEngine::from_model_directory(
+            directory, threads,
+        )?))
     }
 
-    pub fn with_runtime(runtime: &mnn_runtime::Runtime) -> Result<Self> {
-        Ok(Self::new(GazeEngine::new(runtime, ModelBundle::bundled())?))
+    pub fn with_runtime(runtime: &mnn_runtime::Runtime, models: ModelBundle<'_>) -> Result<Self> {
+        Ok(Self::new(GazeEngine::new(runtime, models)?))
     }
 
     pub async fn cameras(&self) -> Result<Vec<CameraDescriptor>> {

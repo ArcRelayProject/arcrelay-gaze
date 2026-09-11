@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "bundle_version": "1.0.0",
+  "files": [
+    {
+      "name": "face-detection-retail-0004.mnn",
+      "size": 2363656,
+      "sha256": "7f73526600c83ecf30b480e283ed612f0f8b9716a0257b0822d41cf0de8d7550"
+    },
+    {
+      "name": "face-reidentification-retail-0095.mnn",
+      "size": 4454904,
+      "sha256": "455a55d7ebced693ee44230a7c832f7321674bf2f47604380f7f14a602dfd92e"
+    },
+    {
+      "name": "facial-landmarks-35-adas-0002.mnn",
+      "size": 18431648,
+      "sha256": "c956b4a7f41eccbffe3f016aedbf0ae04c1a735db13665a0359f7cd9ed38537d"
+    },
+    {
+      "name": "gaze-estimation-adas-0002-packed.mnn",
+      "size": 7541236,
+      "sha256": "4d9d3fe0a752a6afda45de76a73907d1f8dad3183230aec14ce01ab752d76d53"
+    },
+    {
+      "name": "head-pose-estimation-adas-0001.mnn",
+      "size": 7660080,
+      "sha256": "2b0c4786462845997cd11622854a137ba31e1024fcd9bfa4d0ea107761e8d1b7"
+    },
+    {
+      "name": "open-closed-eye-0001.mnn",
+      "size": 47040,
+      "sha256": "f196cf4f906a3554515d0b82983e80339e6cc44b59b818458f3ca0f190a76f18"
+    }
+  ]
+}

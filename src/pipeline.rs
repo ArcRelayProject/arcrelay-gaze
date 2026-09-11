@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::path::Path;
 use std::time::Instant;
 
 use image::RgbImage;
@@ -26,21 +27,6 @@ pub struct ModelBundle<'a> {
     pub eye_state: &'a [u8],
     pub gaze: &'a [u8],
     pub face_embedding: &'a [u8],
-}
-
-impl ModelBundle<'static> {
-    /// Models bundled with the crate, including their third-party notices.
-    #[must_use]
-    pub fn bundled() -> Self {
-        Self {
-            face: include_bytes!("../models/face-detection-retail-0004.mnn"),
-            landmarks: include_bytes!("../models/facial-landmarks-35-adas-0002.mnn"),
-            head_pose: include_bytes!("../models/head-pose-estimation-adas-0001.mnn"),
-            eye_state: include_bytes!("../models/open-closed-eye-0001.mnn"),
-            gaze: include_bytes!("../models/gaze-estimation-adas-0002-packed.mnn"),
-            face_embedding: include_bytes!("../models/face-reidentification-retail-0095.mnn"),
-        }
-    }
 }
 
 /// Synchronous gaze inference engine. MNN sessions themselves are worker-confined.
@@ -74,11 +60,12 @@ impl GazeEngine {
         Ok(engine)
     }
 
-    /// Load bundled models with a serialized CPU runtime.
-    pub fn bundled(threads: usize) -> Result<Self> {
+    /// Load a verified, architecture-independent model bundle from disk.
+    pub fn from_model_directory(directory: &Path, threads: usize) -> Result<Self> {
+        let models = crate::OwnedModelBundle::load_from_directory(directory)?;
         let runtime = Runtime::new(RuntimeConfig::new().with_threads(threads))
             .map_err(|error| Error::Model(format!("create MNN runtime: {error}")))?;
-        Self::new(&runtime, ModelBundle::bundled())
+        Self::new(&runtime, models.as_borrowed())
     }
 
     /// Run zero-filled inputs through all six models and report graph outputs.

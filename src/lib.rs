@@ -9,6 +9,7 @@ mod error;
 mod image_ops;
 mod mapping;
 mod model;
+mod model_bundle;
 mod observation_filter;
 mod pipeline;
 mod presence;
@@ -20,6 +21,7 @@ mod types;
 pub use calibration::{CalibrationProfile, CalibrationSample, Calibrator, HeadRegionProfile};
 pub use error::{Error, Result};
 pub use mapping::{layout_signature, WorkspaceMapper};
+pub use model_bundle::{ModelFile, OwnedModelBundle, MODEL_BUNDLE_VERSION, MODEL_FILES};
 pub use observation_filter::ObservationFilterConfig;
 pub use pipeline::{GazeEngine, ModelBundle};
 pub use presence::{

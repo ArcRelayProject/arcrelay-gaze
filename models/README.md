@@ -1,8 +1,10 @@
-# Bundled MNN models
+# Downloadable MNN models
 
-These files are converted from the Intel Open Model Zoo FP32 networks documented in the repository
-root's third-party notices. The packed gaze graph preserves the three-input gaze network as one
-flat NCHW-compatible MNN input: left eye, right eye, then the three head-pose angles.
+These files are distributed in the `arcrelay-gaze-models-v1.0.0.zip` asset attached to the
+[`gaze-models-v1.0.0`](https://github.com/ArcRelayProject/arcrelay/releases/tag/gaze-models-v1.0.0)
+GitHub release. They are not stored in Git or embedded into ArcRelay architecture slices. The
+packed gaze graph preserves the three-input gaze network as one flat NCHW-compatible MNN input:
+left eye, right eye, then the three head-pose angles.
 
 | File | SHA-256 |
 | --- | --- |

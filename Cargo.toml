@@ -15,7 +15,6 @@ demo = ["camera"]
 
 [dependencies]
 arcrelay-input = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-input.git", rev = "1114b32ec72c0e9ce93fca61e6d215c173f54e9d" }
-camera = { optional = true, git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
 image = { version = "0.25", default-features = false }
 imageproc = "0.25"
 mnn-runtime = { git = "https://github.com/zibo-chen/mnn-runtime-rs", rev = "2d88f779744a9029859743db9a55b5d00a2622c8" }
@@ -25,6 +24,18 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+camera = { optional = true, default-features = false, features = ["backend-avfoundation"], git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+camera = { optional = true, default-features = false, features = ["backend-mf"], git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+camera = { optional = true, default-features = false, features = ["backend-v4l2"], git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+camera = { optional = true, default-features = false, features = ["backend-camera2"], git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
 
 [[example]]
 name = "egui_demo"
