@@ -1,8 +1,8 @@
 //! Local-first gaze estimation, calibration, and ArcRelay display targeting.
 //!
 //! Camera frames stay in process memory and are never persisted or transmitted.
-//! Face detection is an internal preprocessing stage; this crate performs no
-//! face recognition or identity matching.
+//! Face detection and optional owner-presence matching are local preprocessing
+//! stages. Raw frames and embeddings are never serialized or transmitted.
 
 mod calibration;
 mod error;
@@ -11,6 +11,7 @@ mod mapping;
 mod model;
 mod observation_filter;
 mod pipeline;
+mod presence;
 mod smoothing;
 #[cfg(feature = "camera")]
 mod tracker;
@@ -21,6 +22,10 @@ pub use error::{Error, Result};
 pub use mapping::{layout_signature, WorkspaceMapper};
 pub use observation_filter::ObservationFilterConfig;
 pub use pipeline::{GazeEngine, ModelBundle};
+pub use presence::{
+    PresenceEnrollmentStatus, PresenceObservation, PresenceProfile, PresenceState,
+    FACE_EMBEDDING_DIMENSIONS, PRESENCE_PROFILE_VERSION,
+};
 pub use smoothing::{StabilizerConfig, TargetStabilizer};
 #[cfg(feature = "camera")]
 pub use tracker::{CameraDescriptor, GazeTracker, TrackerConfig, TrackerSession};

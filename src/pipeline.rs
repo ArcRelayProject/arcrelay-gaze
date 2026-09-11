@@ -4,18 +4,20 @@ use std::time::Instant;
 use image::RgbImage;
 use mnn_runtime::{Runtime, RuntimeConfig};
 
-use crate::image_ops::{crop, eye_box, rotate_rgb, to_nchw_bgr};
+use crate::image_ops::{align_face_for_embedding, crop, eye_box, rotate_rgb, to_nchw_bgr};
 use crate::model::{find_output, find_output_len, MnnModel};
+use crate::presence::FaceEmbedding;
 use crate::{Error, GazeObservation, HeadPose, Point, Rect, Result, Vec3};
 
 const FACE_SIZE: u32 = 300;
 const ATTRIBUTE_SIZE: u32 = 60;
 const EYE_STATE_SIZE: u32 = 32;
+const FACE_EMBEDDING_SIZE: u32 = 128;
 const FACE_CONFIDENCE: f32 = 0.60;
 const NMS_THRESHOLD: f32 = 0.45;
 const EYE_BOX_SCALE: f32 = 1.8;
 
-/// Bytes for the five networks used by the Intel-style gaze pipeline.
+/// Bytes for the six networks used by gaze and local presence recognition.
 #[derive(Clone, Copy)]
 pub struct ModelBundle<'a> {
     pub face: &'a [u8],
@@ -23,6 +25,7 @@ pub struct ModelBundle<'a> {
     pub head_pose: &'a [u8],
     pub eye_state: &'a [u8],
     pub gaze: &'a [u8],
+    pub face_embedding: &'a [u8],
 }
 
 impl ModelBundle<'static> {
@@ -35,6 +38,7 @@ impl ModelBundle<'static> {
             head_pose: include_bytes!("../models/head-pose-estimation-adas-0001.mnn"),
             eye_state: include_bytes!("../models/open-closed-eye-0001.mnn"),
             gaze: include_bytes!("../models/gaze-estimation-adas-0002-packed.mnn"),
+            face_embedding: include_bytes!("../models/face-reidentification-retail-0095.mnn"),
         }
     }
 }
@@ -46,6 +50,7 @@ pub struct GazeEngine {
     head_pose: MnnModel,
     eye_state: MnnModel,
     gaze: MnnModel,
+    face_embedding: MnnModel,
     roll_align: bool,
 }
 
@@ -58,6 +63,11 @@ impl GazeEngine {
             head_pose: MnnModel::load(runtime, "head pose", bundle.head_pose)?,
             eye_state: MnnModel::load(runtime, "eye state", bundle.eye_state)?,
             gaze: MnnModel::load(runtime, "gaze estimation", bundle.gaze)?,
+            face_embedding: MnnModel::load(
+                runtime,
+                "face reidentification",
+                bundle.face_embedding,
+            )?,
             roll_align: true,
         };
         engine.validate_shapes()?;
@@ -71,7 +81,7 @@ impl GazeEngine {
         Self::new(&runtime, ModelBundle::bundled())
     }
 
-    /// Run zero-filled inputs through all five models and report graph outputs.
+    /// Run zero-filled inputs through all six models and report graph outputs.
     pub fn self_test(&self) -> Result<Vec<String>> {
         let face = self.face.run(vec![0.0; 3 * 300 * 300])?;
         if find_output_len(&face, 12_996).is_none() || find_output_len(&face, 6_498).is_none() {
@@ -103,12 +113,23 @@ impl GazeEngine {
                 "gaze returned unexpected outputs: {gaze:?}"
             )));
         }
+        let face_embedding = self.face_embedding.run(vec![
+            0.0;
+            3 * FACE_EMBEDDING_SIZE as usize
+                * FACE_EMBEDDING_SIZE as usize
+        ])?;
+        if find_output_len(&face_embedding, 256).is_none() {
+            return Err(Error::Model(format!(
+                "face reidentification returned unexpected outputs: {face_embedding:?}"
+            )));
+        }
         Ok([
             ("face", face),
             ("landmarks", landmarks),
             ("head_pose", pose),
             ("eye_state", eye_state),
             ("gaze", gaze),
+            ("face_embedding", face_embedding),
         ]
         .into_iter()
         .map(|(model, outputs)| {
@@ -145,6 +166,11 @@ impl GazeEngine {
                 &[1, 3, 32, 32][..],
             ),
             ("gaze", self.gaze.input_shape(), &[1, 21_603][..]),
+            (
+                "face reidentification",
+                self.face_embedding.input_shape(),
+                &[1, 3, 128, 128][..],
+            ),
         ];
         for (name, actual, wanted) in expected {
             if actual != wanted {
@@ -156,34 +182,30 @@ impl GazeEngine {
         Ok(())
     }
 
-    /// Estimate gaze from one packed RGB frame.
+    /// Estimate gaze from one packed RGB frame without exporting biometric data.
     pub fn infer(&self, frame: &RgbImage) -> Result<Option<GazeObservation>> {
+        self.infer_frame(frame, false)
+            .map(|result| result.observation)
+    }
+
+    pub(crate) fn infer_with_presence(&self, frame: &RgbImage) -> Result<FrameInference> {
+        self.infer_frame(frame, true)
+    }
+
+    fn infer_frame(&self, frame: &RgbImage, include_embeddings: bool) -> Result<FrameInference> {
         let started = Instant::now();
-        let Some((face, confidence)) = self.detect_primary_face(frame)? else {
-            return Ok(None);
+        let faces = self.detect_faces(frame)?;
+        let face_count = faces.len();
+        let Some(&(face, confidence)) = faces.first() else {
+            return Ok(FrameInference {
+                observation: None,
+                face_count: 0,
+                embeddings: Vec::new(),
+            });
         };
         let face_image = crop(frame, face)
             .ok_or_else(|| Error::Model("detected face crop is invalid".into()))?;
-
-        let landmarks_raw = self.landmarks.run_one(to_nchw_bgr(
-            &face_image,
-            ATTRIBUTE_SIZE,
-            ATTRIBUTE_SIZE,
-            false,
-        ))?;
-        if landmarks_raw.len() != 70 {
-            return Err(Error::Model(format!(
-                "landmark output has {}, expected 70",
-                landmarks_raw.len()
-            )));
-        }
-        let landmarks = landmarks_raw
-            .chunks_exact(2)
-            .map(|xy| Point {
-                x: face.x + xy[0] * face.width,
-                y: face.y + xy[1] * face.height,
-            })
-            .collect::<Vec<_>>();
+        let landmarks = self.face_landmarks(&face_image, face)?;
 
         let pose_outputs = self.head_pose.run(to_nchw_bgr(
             &face_image,
@@ -253,12 +275,12 @@ impl GazeEngine {
             }
         }
 
-        Ok(Some(GazeObservation {
+        let observation = GazeObservation {
             frame_width: frame.width(),
             frame_height: frame.height(),
             face,
             face_confidence: confidence,
-            landmarks,
+            landmarks: landmarks.clone(),
             left_eye,
             right_eye,
             left_eye_open,
@@ -266,7 +288,68 @@ impl GazeEngine {
             head_pose,
             gaze,
             inference_ms: started.elapsed().as_secs_f32() * 1_000.0,
-        }))
+        };
+        let mut embeddings = Vec::new();
+        if include_embeddings {
+            if let Some(embedding) = self.face_embedding(frame, &landmarks)? {
+                embeddings.push(embedding);
+            }
+            for &(secondary_face, _) in faces.iter().skip(1) {
+                let Some(face_image) = crop(frame, secondary_face) else {
+                    continue;
+                };
+                let landmarks = self.face_landmarks(&face_image, secondary_face)?;
+                if let Some(embedding) = self.face_embedding(frame, &landmarks)? {
+                    embeddings.push(embedding);
+                }
+            }
+        }
+        Ok(FrameInference {
+            observation: Some(observation),
+            face_count,
+            embeddings,
+        })
+    }
+
+    fn face_landmarks(&self, face_image: &RgbImage, face: Rect) -> Result<Vec<Point>> {
+        let landmarks_raw = self.landmarks.run_one(to_nchw_bgr(
+            face_image,
+            ATTRIBUTE_SIZE,
+            ATTRIBUTE_SIZE,
+            false,
+        ))?;
+        if landmarks_raw.len() != 70 {
+            return Err(Error::Model(format!(
+                "landmark output has {}, expected 70",
+                landmarks_raw.len()
+            )));
+        }
+        Ok(landmarks_raw
+            .chunks_exact(2)
+            .map(|xy| Point {
+                x: face.x + xy[0] * face.width,
+                y: face.y + xy[1] * face.height,
+            })
+            .collect())
+    }
+
+    fn face_embedding(
+        &self,
+        frame: &RgbImage,
+        landmarks: &[Point],
+    ) -> Result<Option<FaceEmbedding>> {
+        let Some(aligned) = align_face_for_embedding(frame, landmarks) else {
+            return Ok(None);
+        };
+        self.face_embedding
+            .run_one(to_nchw_bgr(
+                &aligned,
+                FACE_EMBEDDING_SIZE,
+                FACE_EMBEDDING_SIZE,
+                false,
+            ))
+            .and_then(FaceEmbedding::new)
+            .map(Some)
     }
 
     fn eye_is_open(&self, image: &RgbImage) -> Result<bool> {
@@ -282,7 +365,7 @@ impl GazeEngine {
         Ok(output[1] > output[0])
     }
 
-    fn detect_primary_face(&self, frame: &RgbImage) -> Result<Option<(Rect, f32)>> {
+    fn detect_faces(&self, frame: &RgbImage) -> Result<Vec<(Rect, f32)>> {
         let outputs = self
             .face
             .run(to_nchw_bgr(frame, FACE_SIZE, FACE_SIZE, false))?;
@@ -294,8 +377,7 @@ impl GazeEngine {
         detections.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         Ok(nms(detections, NMS_THRESHOLD)
             .into_iter()
-            .next()
-            .and_then(|detection| {
+            .filter_map(|detection| {
                 Rect {
                     x: detection.x_min * frame.width() as f32,
                     y: detection.y_min * frame.height() as f32,
@@ -304,8 +386,15 @@ impl GazeEngine {
                 }
                 .clamp(frame.width(), frame.height())
                 .map(|rect| (rect, detection.confidence))
-            }))
+            })
+            .collect())
     }
+}
+
+pub(crate) struct FrameInference {
+    pub(crate) observation: Option<GazeObservation>,
+    pub(crate) face_count: usize,
+    pub(crate) embeddings: Vec<FaceEmbedding>,
 }
 
 #[derive(Clone, Copy, Debug)]

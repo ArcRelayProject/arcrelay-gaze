@@ -5,15 +5,17 @@ use camera::{
     CameraSystem, DeliveryPolicy, DeviceId, FrameRate, MemoryBudget, OutputFormat, StreamRequest,
 };
 use image::RgbImage;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
 use crate::observation_filter::ObservationFilter;
+use crate::presence::{classify_presence, PresenceEnrollment, PresenceStabilizer};
 use crate::{Error, ModelBundle};
 use crate::{
-    GazeEngine, ObservationFilterConfig, Result, StabilizerConfig, TargetStabilizer, TrackerEvent,
-    TrackerSnapshot, TrackingState, WorkspaceMapper,
+    GazeEngine, ObservationFilterConfig, PresenceEnrollmentStatus, PresenceProfile, Result,
+    StabilizerConfig, TargetStabilizer, TrackerEvent, TrackerSnapshot, TrackingState,
+    WorkspaceMapper,
 };
 
 /// Camera shown to the ArcRelay desktop UI.
@@ -33,6 +35,7 @@ pub struct TrackerConfig {
     pub fps: u32,
     pub inference_interval: Duration,
     pub include_preview: bool,
+    pub presence_enabled: bool,
     pub observation_filter: ObservationFilterConfig,
     pub stabilizer: StabilizerConfig,
 }
@@ -45,6 +48,7 @@ impl Default for TrackerConfig {
             fps: 30,
             inference_interval: Duration::from_millis(66),
             include_preview: false,
+            presence_enabled: true,
             observation_filter: ObservationFilterConfig::default(),
             stabilizer: StabilizerConfig::default(),
         }
@@ -56,6 +60,9 @@ pub struct GazeTracker {
     engine: Arc<GazeEngine>,
     camera_system: CameraSystem,
     mapper: Arc<RwLock<Option<Arc<WorkspaceMapper>>>>,
+    presence_profile: Arc<RwLock<Option<PresenceProfile>>>,
+    presence_enrollment: Arc<Mutex<Option<PresenceEnrollment>>>,
+    completed_presence_profile: Arc<Mutex<Option<PresenceProfile>>>,
 }
 
 impl GazeTracker {
@@ -65,6 +72,9 @@ impl GazeTracker {
             engine: Arc::new(engine),
             camera_system: CameraSystem::new(),
             mapper: Arc::new(RwLock::new(None)),
+            presence_profile: Arc::new(RwLock::new(None)),
+            presence_enrollment: Arc::new(Mutex::new(None)),
+            completed_presence_profile: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -88,6 +98,33 @@ impl GazeTracker {
 
     pub fn set_workspace_mapper(&self, mapper: Option<WorkspaceMapper>) {
         *self.mapper.write() = mapper.map(Arc::new);
+    }
+
+    pub fn set_presence_profile(&self, mut profile: Option<PresenceProfile>) -> Result<()> {
+        if let Some(profile) = profile.as_mut() {
+            profile.validate()?;
+        }
+        *self.presence_profile.write() = profile;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn presence_profile(&self) -> Option<PresenceProfile> {
+        self.presence_profile.read().clone()
+    }
+
+    pub fn begin_presence_enrollment(&self, display_name: impl Into<String>) -> Result<()> {
+        *self.presence_enrollment.lock() = Some(PresenceEnrollment::new(display_name)?);
+        self.completed_presence_profile.lock().take();
+        Ok(())
+    }
+
+    pub fn cancel_presence_enrollment(&self) {
+        self.presence_enrollment.lock().take();
+    }
+
+    pub fn take_completed_presence_profile(&self) -> Option<PresenceProfile> {
+        self.completed_presence_profile.lock().take()
     }
 
     pub async fn start(&self, camera_id: &str, config: TrackerConfig) -> Result<TrackerSession> {
@@ -138,11 +175,15 @@ impl GazeTracker {
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let engine = self.engine.clone();
         let mapper = self.mapper.clone();
+        let presence_profile = self.presence_profile.clone();
+        let presence_enrollment = self.presence_enrollment.clone();
+        let completed_presence_profile = self.completed_presence_profile.clone();
         let events = event_tx.clone();
         let task = tokio::spawn(async move {
             let mut receiver = capture.subscribe();
             let mut observation_filter = ObservationFilter::new(config.observation_filter);
             let mut stabilizer = TargetStabilizer::new(config.stabilizer);
+            let mut presence_stabilizer = PresenceStabilizer::new(Instant::now());
             let mut last_inference = None;
             let mut snapshot = snapshot_tx.borrow().clone();
             snapshot.state = TrackingState::Tracking;
@@ -185,7 +226,7 @@ impl GazeTracker {
                             continue;
                         };
                         let inference_engine = engine.clone();
-                        let raw_observation = match tokio::task::spawn_blocking(move || inference_engine.infer(&image)).await {
+                        let frame_inference = match tokio::task::spawn_blocking(move || inference_engine.infer_with_presence(&image)).await {
                             Ok(Ok(observation)) => observation,
                             Ok(Err(error)) => {
                                 snapshot.state = TrackingState::Failed;
@@ -201,8 +242,49 @@ impl GazeTracker {
                             }
                         };
                         let filtered_at = Instant::now();
-                        let observation = raw_observation
+                        let observation = frame_inference.observation
                             .map(|observation| observation_filter.update(observation, filtered_at));
+                        if config.presence_enabled
+                            && observation.as_ref().is_some_and(enrollment_quality_is_acceptable)
+                        {
+                            let completed = {
+                                let mut enrollment = presence_enrollment.lock();
+                                enrollment
+                                    .as_mut()
+                                    .map(|enrollment| enrollment.push(frame_inference.face_count, &frame_inference.embeddings))
+                                    .transpose()
+                            };
+                            match completed {
+                                Ok(Some(Some(profile))) => {
+                                    *presence_profile.write() = Some(profile.clone());
+                                    *completed_presence_profile.lock() = Some(profile);
+                                    presence_enrollment.lock().take();
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "presence enrollment was cancelled");
+                                    presence_enrollment.lock().take();
+                                }
+                            }
+                        }
+                        let raw_presence = if config.presence_enabled {
+                            classify_presence(
+                                presence_profile.read().as_ref(),
+                                frame_inference.face_count,
+                                &frame_inference.embeddings,
+                            )
+                        } else {
+                            Default::default()
+                        };
+                        snapshot.presence = presence_stabilizer.update(raw_presence, filtered_at);
+                        snapshot.presence_enrollment = presence_enrollment
+                            .lock()
+                            .as_ref()
+                            .map(PresenceEnrollment::status)
+                            .unwrap_or_else(|| PresenceEnrollmentStatus {
+                                required_samples: 12,
+                                ..PresenceEnrollmentStatus::default()
+                            });
                         snapshot.inferred_frames = snapshot.inferred_frames.saturating_add(1);
                         snapshot.dropped_frames = receiver.dropped_frames();
                         snapshot.frame_width = layout.width;
@@ -248,6 +330,14 @@ impl GazeTracker {
             task: Some(task),
         })
     }
+}
+
+fn enrollment_quality_is_acceptable(observation: &crate::GazeObservation) -> bool {
+    observation.face_confidence >= 0.75
+        && observation.head_pose.yaw.abs() <= 35.0
+        && observation.head_pose.pitch.abs() <= 25.0
+        && observation.face.width >= observation.frame_width as f32 * 0.12
+        && observation.face.height >= observation.frame_height as f32 * 0.18
 }
 
 async fn camera_descriptors(system: &CameraSystem) -> Result<Vec<CameraDescriptor>> {

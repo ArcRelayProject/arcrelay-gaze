@@ -1,7 +1,7 @@
 # arcrelay-gaze
 
 `arcrelay-gaze` is ArcRelay's local-first gaze estimation module. It captures RGB frames through
-[`camera-rs`](https://gitea.czbrcj.cn/Medivh/camera-rs), executes the five-stage Intel Open Model
+[`camera-rs`](https://gitea.czbrcj.cn/Medivh/camera-rs), executes the six-stage Intel Open Model
 Zoo pipeline with MNN, calibrates observations into Arc Input's physical desk coordinates, and
 stabilizes a multi-display target. Frames remain in memory and the crate performs no face
 recognition.
@@ -22,7 +22,7 @@ The implementation follows four layers that can be tested independently:
 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo
 ```
 
-Use `--self-test` to execute all five bundled MNN graphs without opening a camera:
+Use `--self-test` to execute all six bundled MNN graphs without opening a camera:
 
 ```bash
 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run --features demo --example egui_demo -- --self-test

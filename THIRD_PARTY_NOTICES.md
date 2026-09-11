@@ -7,6 +7,7 @@ Apache License 2.0. Conversion to MNN changes the container and graph representa
 license.
 
 - `face-detection-retail-0004`
+- `face-reidentification-retail-0095`
 - `facial-landmarks-35-adas-0002`
 - `head-pose-estimation-adas-0001`
 - `open-closed-eye-0001`

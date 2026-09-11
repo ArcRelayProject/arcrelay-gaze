@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::{PresenceEnrollmentStatus, PresenceObservation};
+
 /// Point in a captured camera frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -184,6 +186,8 @@ pub struct TrackerSnapshot {
     pub dropped_frames: u64,
     pub observation: Option<GazeObservation>,
     pub target: Option<StabilizedTarget>,
+    pub presence: PresenceObservation,
+    pub presence_enrollment: PresenceEnrollmentStatus,
     pub error: Option<String>,
 }
 
@@ -200,6 +204,8 @@ impl Default for TrackerSnapshot {
             dropped_frames: 0,
             observation: None,
             target: None,
+            presence: PresenceObservation::default(),
+            presence_enrollment: PresenceEnrollmentStatus::default(),
             error: None,
         }
     }
