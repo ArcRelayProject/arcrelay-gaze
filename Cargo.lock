@@ -260,7 +260,7 @@ dependencies = [
 [[package]]
 name = "arcrelay-input"
 version = "0.1.0"
-source = "git+https://github.com/ArcRelayProject/arcrelay-input.git?rev=e15d533c462d8a0301c1954102246d3b36b56cea#e15d533c462d8a0301c1954102246d3b36b56cea"
+source = "git+https://github.com/ArcRelayProject/arcrelay-input.git?rev=1114b32ec72c0e9ce93fca61e6d215c173f54e9d#1114b32ec72c0e9ce93fca61e6d215c173f54e9d"
 dependencies = [
  "arc-swap",
  "arcrelay-peer",
