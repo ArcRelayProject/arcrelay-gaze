@@ -15,7 +15,7 @@ demo = ["camera"]
 
 [dependencies]
 arcrelay-input = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-input.git", rev = "e15d533c462d8a0301c1954102246d3b36b56cea" }
-camera = { optional = true, git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "c5b8ce3f1237a5334ceb3f5d8257067c0a12c5ed" }
+camera = { optional = true, git = "https://gitea.czbrcj.cn/Medivh/camera-rs.git", rev = "cb106959448ead99cb453ab6f6731e3cbdc50bdd" }
 image = { version = "0.25", default-features = false }
 imageproc = "0.25"
 mnn-runtime = { git = "https://github.com/zibo-chen/mnn-runtime-rs", rev = "2d88f779744a9029859743db9a55b5d00a2622c8" }

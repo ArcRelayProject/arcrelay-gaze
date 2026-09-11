@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "camera"
 version = "0.3.0"
-source = "git+https://gitea.czbrcj.cn/Medivh/camera-rs.git?rev=c5b8ce3f1237a5334ceb3f5d8257067c0a12c5ed#c5b8ce3f1237a5334ceb3f5d8257067c0a12c5ed"
+source = "git+https://gitea.czbrcj.cn/Medivh/camera-rs.git?rev=cb106959448ead99cb453ab6f6731e3cbdc50bdd#cb106959448ead99cb453ab6f6731e3cbdc50bdd"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -4254,7 +4254,6 @@ dependencies = [
  "anyhow",
  "cmake",
  "libc",
- "pkg-config",
 ]
 
 [[package]]
