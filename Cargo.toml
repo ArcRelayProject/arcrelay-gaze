@@ -6,7 +6,7 @@ rust-version = "1.88"
 license = "AGPL-3.0-only"
 publish = false
 description = "Local-first gaze tracking and ArcRelay workspace targeting"
-repository = "https://gitea.czbrcj.cn/ArcRelay/arcrelay-gaze"
+repository = "https://github.com/ArcRelayProject/arcrelay-gaze"
 
 [features]
 default = ["camera"]
