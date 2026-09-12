@@ -243,7 +243,7 @@ name = "arcrelay-gaze"
 version = "0.1.0"
 dependencies = [
  "arcrelay-input",
- "camera",
+ "camera-rs",
  "eframe",
  "image",
  "imageproc",
@@ -782,9 +782,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "camera"
-version = "0.3.0"
-source = "git+https://gitea.czbrcj.cn/Medivh/camera-rs.git?rev=cb106959448ead99cb453ab6f6731e3cbdc50bdd#cb106959448ead99cb453ab6f6731e3cbdc50bdd"
+name = "camera-rs"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec21dc0bae1e191d3c66b5bc5f164f0878e6d26aea8d68f728dcd46c4a218587"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -4014,7 +4015,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -4254,6 +4255,7 @@ dependencies = [
  "anyhow",
  "cmake",
  "libc",
+ "pkg-config",
 ]
 
 [[package]]

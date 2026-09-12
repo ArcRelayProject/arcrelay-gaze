@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use camera::{
-    CameraSystem, DeliveryPolicy, DeviceId, FrameRate, MemoryBudget, OutputFormat, StreamRequest,
+    CameraErrorKind, CameraSystem, CaptureRequest, ConversionRequest, DeviceId, DeviceSelector,
+    FrameRate, MemoryBudget, RgbConverter, SubscriptionOptions,
 };
 use image::RgbImage;
 use parking_lot::{Mutex, RwLock};
@@ -149,7 +150,7 @@ impl GazeTracker {
         let device = devices
             .into_iter()
             .find(|device| device.id.to_string() == camera_id)
-            .ok_or_else(|| camera::CameraError::DeviceNotFound(camera_id.into()))?;
+            .ok_or_else(|| camera::CameraError::device_not_found(camera_id.into()))?;
         self.start_device(device.id, device.name, config).await
     }
 
@@ -159,12 +160,13 @@ impl GazeTracker {
         device_name: String,
         config: TrackerConfig,
     ) -> Result<TrackerSession> {
-        let mut camera = self.camera_system.open(&device_id).await?;
-        let request = StreamRequest::builder()
-            .resolution(config.width, config.height)
-            .frame_rate(FrameRate::new(config.fps, 1)?)
-            .output(OutputFormat::Rgb8)
-            .delivery(DeliveryPolicy::Latest)
+        let mut camera = self
+            .camera_system
+            .open(DeviceSelector::Id(device_id.clone()))
+            .await?;
+        let request = CaptureRequest::builder()
+            .preferred_resolution(config.width, config.height)
+            .preferred_frame_rate(FrameRate::new(config.fps, 1)?)
             .memory_budget(MemoryBudget {
                 buffers: 4,
                 bytes: 32 * 1024 * 1024,
@@ -172,7 +174,8 @@ impl GazeTracker {
             .startup_timeout(Duration::from_secs(5))
             .build()?;
         let capture = camera.start(request).await?;
-        let negotiated = capture.negotiated_config().capture.clone();
+        let negotiated = capture.negotiated().capture.clone();
+        let mut receiver = capture.subscribe(SubscriptionOptions::latest())?;
         let camera_id = device_id.to_string();
         let initial = TrackerSnapshot {
             state: TrackingState::Starting,
@@ -193,7 +196,7 @@ impl GazeTracker {
         let preview_enabled = self.preview_enabled.clone();
         let events = event_tx.clone();
         let task = tokio::spawn(async move {
-            let mut receiver = capture.subscribe();
+            let mut converter = RgbConverter::new();
             let mut observation_filter = ObservationFilter::new(config.observation_filter);
             let mut stabilizer = TargetStabilizer::new(config.stabilizer);
             let mut presence_stabilizer = PresenceStabilizer::new(Instant::now());
@@ -211,13 +214,13 @@ impl GazeTracker {
                     frame = receiver.next() => {
                         let frame = match frame {
                             Ok(frame) => frame,
-                            Err(camera::CameraError::StreamStopped) => break,
+                            Err(error) if error.kind() == CameraErrorKind::StreamStopped => break,
                             Err(error) => {
                                 snapshot.state = TrackingState::Failed;
                                 snapshot.error = Some(error.to_string());
                                 snapshot_tx.send_replace(snapshot.clone());
                                 let _ = events.send(TrackerEvent { snapshot, rgb_preview: None });
-                                let _ = capture.stop().await;
+                                let _ = capture.close().await;
                                 return;
                             }
                         };
@@ -230,10 +233,25 @@ impl GazeTracker {
                         }
                         last_inference = Some(now);
                         let layout = frame.layout();
-                        let pixels = frame.bytes().to_vec();
+                        let conversion = ConversionRequest::for_layout(layout);
+                        let mut pixels = match conversion.output_len() {
+                            Ok(length) => vec![0; length],
+                            Err(error) => {
+                                snapshot.state = TrackingState::Failed;
+                                snapshot.error = Some(error.to_string());
+                                snapshot_tx.send_replace(snapshot.clone());
+                                break;
+                            }
+                        };
+                        if let Err(error) = converter.convert_into(&frame, conversion, &mut pixels) {
+                            snapshot.state = TrackingState::Failed;
+                            snapshot.error = Some(error.to_string());
+                            snapshot_tx.send_replace(snapshot.clone());
+                            break;
+                        }
                         let preview = (config.include_preview
                             || preview_enabled.load(Ordering::Acquire))
-                        .then(|| Arc::<[u8]>::from(pixels.clone()));
+                            .then(|| Arc::<[u8]>::from(pixels.clone()));
                         let Some(image) = RgbImage::from_raw(layout.width, layout.height, pixels) else {
                             snapshot.state = TrackingState::Failed;
                             snapshot.error = Some("camera returned an invalid RGB frame".into());
@@ -324,7 +342,7 @@ impl GazeTracker {
             }
             snapshot.state = TrackingState::Stopping;
             snapshot_tx.send_replace(snapshot.clone());
-            if let Err(error) = capture.stop().await {
+            if let Err(error) = capture.close().await {
                 snapshot.state = TrackingState::Failed;
                 snapshot.error = Some(error.to_string());
             } else {

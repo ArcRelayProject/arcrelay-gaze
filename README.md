@@ -1,7 +1,7 @@
 # arcrelay-gaze
 
 `arcrelay-gaze` is ArcRelay's local-first gaze estimation module. It captures RGB frames through
-[`camera-rs`](https://gitea.czbrcj.cn/Medivh/camera-rs), executes the six-stage Intel Open Model
+[`camera-rs`](https://crates.io/crates/camera-rs), executes the six-stage Intel Open Model
 Zoo pipeline with MNN, calibrates observations into Arc Input's physical desk coordinates, and
 stabilizes a multi-display target. Frames remain in memory and the crate performs no face
 recognition.
