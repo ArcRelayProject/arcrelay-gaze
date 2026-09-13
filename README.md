@@ -3,18 +3,22 @@
 `arcrelay-gaze` is ArcRelay's local-first gaze estimation module. It captures RGB frames through
 [`camera-rs`](https://crates.io/crates/camera-rs), executes the six-stage Intel Open Model
 Zoo pipeline with MNN, calibrates observations into Arc Input's physical desk coordinates, and
-stabilizes a multi-display target. Frames remain in memory and the crate performs no face
-recognition.
+stabilizes a multi-display target, and can match an enrolled local owner for presence policies.
+Frames remain in memory and biometric templates never leave the device.
 
 The implementation follows four layers that can be tested independently:
 
-1. `GazeEngine`: face detection → 35 landmarks → head pose → eye-state gate → gaze vector.
+1. `GazeEngine`: scheduled face detection/tracking → 35 landmarks → head pose → eye-state gate →
+   gaze vector, with an optional local identity stage.
 2. `Calibrator` and `WorkspaceMapper`: per-camera, per-layout calibration into physical desk
    micrometres, followed by display and logical-coordinate resolution.
 3. `GazeTracker`: explicit camera lifecycle, latest-frame delivery, bounded memory and structured
    diagnostics for a desktop host.
 4. `TargetStabilizer`: dwell, display hysteresis and loss grace used by Arc Input's safe
    gaze-preselection policy. Physical mouse or keyboard activity remains the confirmation signal.
+5. `PresenceStabilizer`: track-bound, periodically refreshed owner matching for local privacy
+   consumers. Stable tracks reuse their face region and identity result instead of rerunning the
+   complete detection and recognition pipeline for every frame.
 
 ## Model bundle
 

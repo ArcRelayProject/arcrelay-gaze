@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, DynamicImage, Rgb, RgbImage};
+use image::{imageops::FilterType, Rgb, RgbImage};
 use imageproc::geometric_transformations::{
     rotate_about_center, warp_into, Interpolation, Projection,
 };
@@ -108,9 +108,12 @@ fn similarity_projection(sources: &[Point; 5], targets: &[(f32, f32); 5]) -> Opt
 }
 
 pub(crate) fn to_nchw_bgr(image: &RgbImage, width: u32, height: u32, eye_state: bool) -> Vec<f32> {
-    let resized = DynamicImage::ImageRgb8(image.clone())
-        .resize_exact(width, height, FilterType::Triangle)
-        .to_rgb8();
+    // `DynamicImage::ImageRgb8(image.clone()).resize_exact(...)` used to copy
+    // the complete source before every model stage. A normal gaze frame enters
+    // this function eight times, so that hidden clone was a material part of
+    // the continuous CPU and allocation cost. `imageops::resize` borrows the
+    // source and allocates only the model-sized result.
+    let resized = image::imageops::resize(image, width, height, FilterType::Triangle);
     let plane = (width * height) as usize;
     let mut output = vec![0.0; plane * 3];
     for (index, pixel) in resized.pixels().enumerate() {

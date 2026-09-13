@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
 use crate::observation_filter::ObservationFilter;
+use crate::pipeline::InferencePlan;
 use crate::presence::{
-    classify_presence, PresenceEnrollment, PresenceStabilizer, PRESENCE_ENROLLMENT_REQUIRED_SAMPLES,
+    classify_presence, FaceEmbedding, PresenceEnrollment, PresenceStabilizer,
+    PRESENCE_ENROLLMENT_REQUIRED_SAMPLES,
 };
 use crate::{Error, ModelBundle};
 use crate::{
@@ -39,6 +41,10 @@ pub struct TrackerConfig {
     pub height: u32,
     pub fps: u32,
     pub inference_interval: Duration,
+    pub stable_inference_interval: Duration,
+    pub idle_inference_interval: Duration,
+    pub face_detection_interval: Duration,
+    pub presence_recheck_interval: Duration,
     pub include_preview: bool,
     pub presence_enabled: bool,
     pub observation_filter: ObservationFilterConfig,
@@ -50,8 +56,12 @@ impl Default for TrackerConfig {
         Self {
             width: 640,
             height: 360,
-            fps: 30,
-            inference_interval: Duration::from_millis(66),
+            fps: 15,
+            inference_interval: Duration::from_millis(90),
+            stable_inference_interval: Duration::from_millis(150),
+            idle_inference_interval: Duration::from_millis(300),
+            face_detection_interval: Duration::from_millis(500),
+            presence_recheck_interval: Duration::from_secs(3),
             include_preview: false,
             presence_enabled: true,
             observation_filter: ObservationFilterConfig::default(),
@@ -143,9 +153,15 @@ impl GazeTracker {
     }
 
     pub async fn start(&self, camera_id: &str, config: TrackerConfig) -> Result<TrackerSession> {
-        if config.fps == 0 || config.inference_interval.is_zero() {
+        if config.fps == 0
+            || config.inference_interval.is_zero()
+            || config.stable_inference_interval.is_zero()
+            || config.idle_inference_interval.is_zero()
+            || config.face_detection_interval.is_zero()
+            || config.presence_recheck_interval.is_zero()
+        {
             return Err(Error::InvalidConfig(
-                "fps and inference interval must be positive".into(),
+                "fps and inference intervals must be positive".into(),
             ));
         }
         let devices = self.camera_system.devices().await?;
@@ -199,10 +215,14 @@ impl GazeTracker {
         let events = event_tx.clone();
         let task = tokio::spawn(async move {
             let mut converter = RgbConverter::new();
-            let mut observation_filter = ObservationFilter::new(config.observation_filter);
-            let mut stabilizer = TargetStabilizer::new(config.stabilizer);
+            let mut observation_filter = ObservationFilter::new(config.observation_filter.clone());
+            let mut stabilizer = TargetStabilizer::new(config.stabilizer.clone());
             let mut presence_stabilizer = PresenceStabilizer::new(Instant::now());
             let mut last_inference = None;
+            let mut last_detection = None;
+            let mut last_identity = None;
+            let mut cached_identity: Option<(u64, FaceEmbedding)> = None;
+            let mut previous_luma: Option<Vec<u8>> = None;
             let mut snapshot = snapshot_tx.borrow().clone();
             snapshot.state = TrackingState::Tracking;
             snapshot_tx.send_replace(snapshot.clone());
@@ -228,8 +248,9 @@ impl GazeTracker {
                         };
                         snapshot.captured_frames = snapshot.captured_frames.saturating_add(1);
                         let now = Instant::now();
+                        let inference_interval = adaptive_inference_interval(&config, &snapshot);
                         if last_inference.is_some_and(|last: Instant| {
-                            now.saturating_duration_since(last) < config.inference_interval
+                            now.saturating_duration_since(last) < inference_interval
                         }) {
                             continue;
                         }
@@ -260,8 +281,34 @@ impl GazeTracker {
                             snapshot_tx.send_replace(snapshot.clone());
                             continue;
                         };
+                        let luma = sampled_luma(&image);
+                        let scene_changed = previous_luma
+                            .as_deref()
+                            .is_some_and(|previous| luma_changed(previous, &luma));
+                        previous_luma = Some(luma);
+                        let enrollment_active = presence_enrollment.lock().is_some();
+                        let detection_due = snapshot.observation.is_none()
+                            || scene_changed
+                            || last_detection.is_none_or(|last: Instant| {
+                                now.saturating_duration_since(last)
+                                    >= config.face_detection_interval
+                            });
+                        let identity_due = config.presence_enabled
+                            && (enrollment_active
+                                || scene_changed
+                                || cached_identity.is_none()
+                                || last_identity.is_none_or(|last: Instant| {
+                                    now.saturating_duration_since(last)
+                                        >= config.presence_recheck_interval
+                                }));
                         let inference_engine = engine.clone();
-                        let frame_inference = match tokio::task::spawn_blocking(move || inference_engine.infer_with_presence(&image)).await {
+                        let plan = InferencePlan {
+                            detect_faces: detection_due,
+                            estimate_gaze: true,
+                            identity_tracking: config.presence_enabled,
+                            extract_identity: identity_due,
+                        };
+                        let frame_inference = match tokio::task::spawn_blocking(move || inference_engine.infer_planned(&image, plan)).await {
                             Ok(Ok(observation)) => observation,
                             Ok(Err(error)) => {
                                 snapshot.state = TrackingState::Failed;
@@ -276,6 +323,31 @@ impl GazeTracker {
                                 break;
                             }
                         };
+                        if frame_inference.detection_ran {
+                            last_detection = Some(now);
+                            snapshot.detected_frames = snapshot.detected_frames.saturating_add(1);
+                        } else {
+                            snapshot.tracked_frames = snapshot.tracked_frames.saturating_add(1);
+                        }
+                        if !frame_inference.track_continuous
+                            || cached_identity
+                                .as_ref()
+                                .is_some_and(|(track_id, _)| Some(*track_id) != frame_inference.track_id)
+                        {
+                            cached_identity = None;
+                            last_identity = None;
+                            presence_stabilizer.invalidate_track(
+                                Instant::now(),
+                                presence_profile.read().is_some(),
+                            );
+                        }
+                        if frame_inference.identity_ran {
+                            last_identity = Some(now);
+                            snapshot.identity_frames = snapshot.identity_frames.saturating_add(1);
+                            cached_identity = frame_inference
+                                .track_id
+                                .zip(frame_inference.embeddings.first().cloned());
+                        }
                         let filtered_at = Instant::now();
                         let observation = frame_inference.observation
                             .map(|observation| observation_filter.update(observation, filtered_at));
@@ -311,11 +383,16 @@ impl GazeTracker {
                                 }
                             }
                         }
+                        let cached_embeddings = cached_identity
+                            .as_ref()
+                            .filter(|(track_id, _)| Some(*track_id) == frame_inference.track_id)
+                            .map(|(_, embedding)| std::slice::from_ref(embedding))
+                            .unwrap_or_default();
                         let raw_presence = if config.presence_enabled {
                             classify_presence(
                                 presence_profile.read().as_ref(),
                                 frame_inference.face_count,
-                                &frame_inference.embeddings,
+                                cached_embeddings,
                                 observation.as_ref().map(|observation| observation.head_pose),
                             )
                         } else {
@@ -375,6 +452,60 @@ impl GazeTracker {
             task: Some(task),
         })
     }
+}
+
+fn adaptive_inference_interval(config: &TrackerConfig, snapshot: &TrackerSnapshot) -> Duration {
+    if snapshot.presence_enrollment.active {
+        return config.inference_interval;
+    }
+    if snapshot.observation.is_none() {
+        return config.idle_inference_interval;
+    }
+    if snapshot
+        .target
+        .as_ref()
+        .is_some_and(|target| target.stable_for_ms >= 1_500)
+        || snapshot.presence.stable_for_ms >= 2_000
+    {
+        config.stable_inference_interval
+    } else {
+        config.inference_interval
+    }
+}
+
+const LUMA_WIDTH: usize = 32;
+const LUMA_HEIGHT: usize = 18;
+const LUMA_CHANGE_THRESHOLD: u64 = 14;
+
+fn sampled_luma(image: &RgbImage) -> Vec<u8> {
+    let mut luma = Vec::with_capacity(LUMA_WIDTH * LUMA_HEIGHT);
+    for y in 0..LUMA_HEIGHT {
+        let source_y =
+            (y as u32 * image.height() / LUMA_HEIGHT as u32).min(image.height().saturating_sub(1));
+        for x in 0..LUMA_WIDTH {
+            let source_x =
+                (x as u32 * image.width() / LUMA_WIDTH as u32).min(image.width().saturating_sub(1));
+            let pixel = image.get_pixel(source_x, source_y).0;
+            let value =
+                (u16::from(pixel[0]) * 77 + u16::from(pixel[1]) * 150 + u16::from(pixel[2]) * 29)
+                    >> 8;
+            luma.push(value as u8);
+        }
+    }
+    luma
+}
+
+fn luma_changed(previous: &[u8], current: &[u8]) -> bool {
+    if previous.len() != current.len() || current.is_empty() {
+        return true;
+    }
+    let difference = previous
+        .iter()
+        .zip(current)
+        .map(|(left, right)| u64::from(left.abs_diff(*right)))
+        .sum::<u64>()
+        / current.len() as u64;
+    difference >= LUMA_CHANGE_THRESHOLD
 }
 
 fn enrollment_quality_is_acceptable(observation: &crate::GazeObservation) -> bool {
@@ -447,5 +578,63 @@ impl TrackerSession {
 impl Drop for TrackerSession {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_schedule_slows_only_stable_or_idle_tracking() {
+        let config = TrackerConfig::default();
+        let mut snapshot = TrackerSnapshot::default();
+        assert_eq!(
+            adaptive_inference_interval(&config, &snapshot),
+            config.idle_inference_interval
+        );
+
+        snapshot.observation = Some(crate::GazeObservation {
+            frame_width: 640,
+            frame_height: 360,
+            face: crate::Rect {
+                x: 100.0,
+                y: 60.0,
+                width: 160.0,
+                height: 200.0,
+            },
+            face_confidence: 0.9,
+            landmarks: Vec::new(),
+            left_eye: crate::Rect::default(),
+            right_eye: crate::Rect::default(),
+            left_eye_open: true,
+            right_eye_open: true,
+            head_pose: crate::HeadPose::default(),
+            gaze: crate::Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            inference_ms: 10.0,
+        });
+        assert_eq!(
+            adaptive_inference_interval(&config, &snapshot),
+            config.inference_interval
+        );
+
+        snapshot.presence.stable_for_ms = 2_000;
+        assert_eq!(
+            adaptive_inference_interval(&config, &snapshot),
+            config.stable_inference_interval
+        );
+    }
+
+    #[test]
+    fn sampled_luma_detects_material_scene_changes() {
+        let black = RgbImage::from_pixel(64, 36, image::Rgb([0, 0, 0]));
+        let white = RgbImage::from_pixel(64, 36, image::Rgb([255, 255, 255]));
+        let black_luma = sampled_luma(&black);
+        assert!(!luma_changed(&black_luma, &sampled_luma(&black)));
+        assert!(luma_changed(&black_luma, &sampled_luma(&white)));
     }
 }

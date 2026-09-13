@@ -370,6 +370,24 @@ impl PresenceStabilizer {
             .unwrap_or(u64::MAX);
         self.stable.clone()
     }
+
+    /// Revoke a previously trusted owner immediately when the underlying face
+    /// track is lost or replaced. Normal transitions remain debounced, but a
+    /// cached owner verdict must never survive into a different track epoch.
+    pub(crate) fn invalidate_track(
+        &mut self,
+        now: Instant,
+        profile_enrolled: bool,
+    ) -> PresenceObservation {
+        self.stable = PresenceObservation {
+            state: PresenceState::Uncertain,
+            profile_enrolled,
+            ..PresenceObservation::default()
+        };
+        self.stable_since = now;
+        self.candidate = None;
+        self.stable.clone()
+    }
 }
 
 fn transition_delay(state: PresenceState) -> Duration {
@@ -609,6 +627,26 @@ mod tests {
                 .update(owner, started + Duration::from_millis(901))
                 .state,
             PresenceState::OwnerPresent
+        );
+    }
+
+    #[test]
+    fn track_invalidation_revokes_stable_owner_without_debounce() {
+        let started = Instant::now();
+        let mut stabilizer = PresenceStabilizer::new(started);
+        let owner = classify_presence(Some(&profile()), 1, &[embedding(0)], None);
+        stabilizer.update(owner.clone(), started);
+        assert_eq!(
+            stabilizer
+                .update(owner, started + Duration::from_millis(601))
+                .state,
+            PresenceState::OwnerPresent
+        );
+        assert_eq!(
+            stabilizer
+                .invalidate_track(started + Duration::from_millis(602), true)
+                .state,
+            PresenceState::Uncertain
         );
     }
 

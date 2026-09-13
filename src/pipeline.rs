@@ -39,7 +39,29 @@ pub struct GazeEngine {
     gaze: MnnModel,
     face_embedding: MnnModel,
     roll_align: bool,
-    primary_face: Mutex<Option<Rect>>,
+    primary_track: Mutex<PrimaryTrackState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrimaryTrack {
+    id: u64,
+    face: Rect,
+    confidence: f32,
+    face_count: usize,
+}
+
+#[derive(Default)]
+struct PrimaryTrackState {
+    current: Option<PrimaryTrack>,
+    next_id: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InferencePlan {
+    pub(crate) detect_faces: bool,
+    pub(crate) estimate_gaze: bool,
+    pub(crate) identity_tracking: bool,
+    pub(crate) extract_identity: bool,
 }
 
 impl GazeEngine {
@@ -57,7 +79,7 @@ impl GazeEngine {
                 bundle.face_embedding,
             )?,
             roll_align: true,
-            primary_face: Mutex::new(None),
+            primary_track: Mutex::new(PrimaryTrackState::default()),
         };
         engine.validate_shapes()?;
         Ok(engine)
@@ -174,27 +196,48 @@ impl GazeEngine {
 
     /// Estimate gaze from one packed RGB frame without exporting biometric data.
     pub fn infer(&self, frame: &RgbImage) -> Result<Option<GazeObservation>> {
-        self.infer_frame(frame, false)
-            .map(|result| result.observation)
+        self.infer_frame(
+            frame,
+            InferencePlan {
+                detect_faces: true,
+                estimate_gaze: true,
+                identity_tracking: false,
+                extract_identity: false,
+            },
+        )
+        .map(|result| result.observation)
     }
 
-    pub(crate) fn infer_with_presence(&self, frame: &RgbImage) -> Result<FrameInference> {
-        self.infer_frame(frame, true)
+    pub(crate) fn infer_planned(
+        &self,
+        frame: &RgbImage,
+        plan: InferencePlan,
+    ) -> Result<FrameInference> {
+        self.infer_frame(frame, plan)
     }
 
-    fn infer_frame(&self, frame: &RgbImage, include_embeddings: bool) -> Result<FrameInference> {
+    fn infer_frame(&self, frame: &RgbImage, plan: InferencePlan) -> Result<FrameInference> {
         let started = Instant::now();
-        let mut faces = self.detect_faces(frame)?;
-        let face_count = faces.len();
-        self.stabilize_primary_face(&mut faces);
-        let Some(&(face, confidence)) = faces.first() else {
-            self.primary_face.lock().take();
+        let (track, track_continuous) = if plan.detect_faces {
+            let mut faces = self.detect_faces(frame)?;
+            self.update_primary_track(&mut faces)
+        } else {
+            (self.primary_track.lock().current, true)
+        };
+        let Some(track) = track else {
             return Ok(FrameInference {
                 observation: None,
                 face_count: 0,
                 embeddings: Vec::new(),
+                detection_ran: plan.detect_faces,
+                identity_ran: false,
+                track_id: None,
+                track_continuous,
             });
         };
+        let face = track.face;
+        let confidence = track.confidence;
+        let face_count = track.face_count;
         let face_image = crop(frame, face)
             .ok_or_else(|| Error::Model("detected face crop is invalid".into()))?;
         let landmarks = self.face_landmarks(&face_image, face)?;
@@ -225,14 +268,18 @@ impl GazeEngine {
         let mut right_image =
             crop(frame, right_eye).ok_or_else(|| Error::Model("crop right eye".into()))?;
 
-        let left_eye_open = self.eye_is_open(&rotate_rgb(&left_image, head_pose.roll))?;
-        let right_eye_open = self.eye_is_open(&rotate_rgb(&right_image, head_pose.roll))?;
+        // Eye-state and gaze previously rotated both crops independently twice.
+        // Keep one aligned copy per eye and share it between the two stages.
+        let aligned_left = rotate_rgb(&left_image, head_pose.roll);
+        let aligned_right = rotate_rgb(&right_image, head_pose.roll);
+        let left_eye_open = self.eye_is_open(&aligned_left)?;
+        let right_eye_open = self.eye_is_open(&aligned_right)?;
         let mut gaze = Vec3::default();
-        if left_eye_open && right_eye_open {
+        if plan.estimate_gaze && left_eye_open && right_eye_open {
             let mut pose_for_gaze = head_pose;
             if self.roll_align {
-                left_image = rotate_rgb(&left_image, head_pose.roll);
-                right_image = rotate_rgb(&right_image, head_pose.roll);
+                left_image = aligned_left;
+                right_image = aligned_right;
                 pose_for_gaze.roll = 0.0;
             }
             let mut packed = to_nchw_bgr(&left_image, ATTRIBUTE_SIZE, ATTRIBUTE_SIZE, false);
@@ -282,24 +329,25 @@ impl GazeEngine {
             inference_ms: started.elapsed().as_secs_f32() * 1_000.0,
         };
         let mut embeddings = Vec::new();
-        if include_embeddings {
+        let mut identity_ran = false;
+        // Multiple people is already a fail-closed presence verdict. Computing
+        // landmarks and embeddings for every secondary face cannot change that
+        // verdict, so identity work is restricted to a single continuous track.
+        if plan.identity_tracking && (plan.extract_identity || !track_continuous) && face_count == 1
+        {
+            identity_ran = true;
             if let Some(embedding) = self.face_embedding(frame, &landmarks)? {
                 embeddings.push(embedding);
-            }
-            for &(secondary_face, _) in faces.iter().skip(1) {
-                let Some(face_image) = crop(frame, secondary_face) else {
-                    continue;
-                };
-                let landmarks = self.face_landmarks(&face_image, secondary_face)?;
-                if let Some(embedding) = self.face_embedding(frame, &landmarks)? {
-                    embeddings.push(embedding);
-                }
             }
         }
         Ok(FrameInference {
             observation: Some(observation),
             face_count,
             embeddings,
+            detection_ran: plan.detect_faces,
+            identity_ran,
+            track_id: Some(track.id),
+            track_continuous,
         })
     }
 
@@ -382,30 +430,48 @@ impl GazeEngine {
             .collect())
     }
 
-    fn stabilize_primary_face(&self, faces: &mut [(Rect, f32)]) {
+    fn update_primary_track(&self, faces: &mut [(Rect, f32)]) -> (Option<PrimaryTrack>, bool) {
+        let mut state = self.primary_track.lock();
         if faces.is_empty() {
-            return;
+            let continuous = state.current.is_none();
+            state.current = None;
+            return (None, continuous);
         }
-        let previous = *self.primary_face.lock();
+        let previous = state.current;
         let selected = previous
             .and_then(|previous| {
                 faces
                     .iter()
                     .enumerate()
-                    .map(|(index, (face, _))| (index, rect_iou(previous, *face)))
+                    .map(|(index, (face, _))| (index, rect_iou(previous.face, *face)))
                     .max_by(|left, right| left.1.total_cmp(&right.1))
-                    .filter(|(_, overlap)| *overlap >= 0.08)
+                    .filter(|(_, overlap)| *overlap >= 0.15)
                     .map(|(index, _)| index)
             })
             .unwrap_or(0);
         faces.swap(0, selected);
-        let raw = faces[0].0;
+        let (raw, confidence) = faces[0];
+        let track_continuous =
+            previous.is_some_and(|previous| rect_iou(previous.face, raw) >= 0.15);
         let stable = previous
-            .filter(|previous| rect_iou(*previous, raw) >= 0.08)
-            .map(|previous| blend_rect(previous, raw, 0.38))
+            .filter(|previous| track_continuous && rect_iou(previous.face, raw) >= 0.15)
+            .map(|previous| blend_rect(previous.face, raw, 0.38))
             .unwrap_or(raw);
         faces[0].0 = stable;
-        *self.primary_face.lock() = Some(stable);
+        let id = if track_continuous {
+            previous.expect("continuous track has previous state").id
+        } else {
+            state.next_id = state.next_id.saturating_add(1).max(1);
+            state.next_id
+        };
+        let track = PrimaryTrack {
+            id,
+            face: stable,
+            confidence,
+            face_count: faces.len(),
+        };
+        state.current = Some(track);
+        (Some(track), track_continuous)
     }
 }
 
@@ -433,6 +499,10 @@ pub(crate) struct FrameInference {
     pub(crate) observation: Option<GazeObservation>,
     pub(crate) face_count: usize,
     pub(crate) embeddings: Vec<FaceEmbedding>,
+    pub(crate) detection_ran: bool,
+    pub(crate) identity_ran: bool,
+    pub(crate) track_id: Option<u64>,
+    pub(crate) track_continuous: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
