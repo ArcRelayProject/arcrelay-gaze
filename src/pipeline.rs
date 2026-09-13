@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use image::RgbImage;
 use mnn_runtime::{Runtime, RuntimeConfig};
+use parking_lot::Mutex;
 
 use crate::image_ops::{align_face_for_embedding, crop, eye_box, rotate_rgb, to_nchw_bgr};
 use crate::model::{find_output, find_output_len, MnnModel};
@@ -38,6 +39,7 @@ pub struct GazeEngine {
     gaze: MnnModel,
     face_embedding: MnnModel,
     roll_align: bool,
+    primary_face: Mutex<Option<Rect>>,
 }
 
 impl GazeEngine {
@@ -55,6 +57,7 @@ impl GazeEngine {
                 bundle.face_embedding,
             )?,
             roll_align: true,
+            primary_face: Mutex::new(None),
         };
         engine.validate_shapes()?;
         Ok(engine)
@@ -181,9 +184,11 @@ impl GazeEngine {
 
     fn infer_frame(&self, frame: &RgbImage, include_embeddings: bool) -> Result<FrameInference> {
         let started = Instant::now();
-        let faces = self.detect_faces(frame)?;
+        let mut faces = self.detect_faces(frame)?;
         let face_count = faces.len();
+        self.stabilize_primary_face(&mut faces);
         let Some(&(face, confidence)) = faces.first() else {
+            self.primary_face.lock().take();
             return Ok(FrameInference {
                 observation: None,
                 face_count: 0,
@@ -376,6 +381,52 @@ impl GazeEngine {
             })
             .collect())
     }
+
+    fn stabilize_primary_face(&self, faces: &mut [(Rect, f32)]) {
+        if faces.is_empty() {
+            return;
+        }
+        let previous = *self.primary_face.lock();
+        let selected = previous
+            .and_then(|previous| {
+                faces
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (face, _))| (index, rect_iou(previous, *face)))
+                    .max_by(|left, right| left.1.total_cmp(&right.1))
+                    .filter(|(_, overlap)| *overlap >= 0.08)
+                    .map(|(index, _)| index)
+            })
+            .unwrap_or(0);
+        faces.swap(0, selected);
+        let raw = faces[0].0;
+        let stable = previous
+            .filter(|previous| rect_iou(*previous, raw) >= 0.08)
+            .map(|previous| blend_rect(previous, raw, 0.38))
+            .unwrap_or(raw);
+        faces[0].0 = stable;
+        *self.primary_face.lock() = Some(stable);
+    }
+}
+
+fn blend_rect(previous: Rect, current: Rect, alpha: f32) -> Rect {
+    let blend = |a: f32, b: f32| a + (b - a) * alpha;
+    Rect {
+        x: blend(previous.x, current.x),
+        y: blend(previous.y, current.y),
+        width: blend(previous.width, current.width),
+        height: blend(previous.height, current.height),
+    }
+}
+
+fn rect_iou(a: Rect, b: Rect) -> f32 {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    let intersection = (right - left).max(0.0) * (bottom - top).max(0.0);
+    let union = a.width * a.height + b.width * b.height - intersection;
+    intersection / union.max(f32::EPSILON)
 }
 
 pub(crate) struct FrameInference {

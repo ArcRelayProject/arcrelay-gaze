@@ -7,15 +7,19 @@ use crate::{GazeTarget, StabilizedTarget};
 pub struct StabilizerConfig {
     pub dwell: Duration,
     pub loss_timeout: Duration,
+    pub switch_cooldown: Duration,
+    pub minimum_confidence: f32,
     pub smoothing_alpha: f64,
 }
 
 impl Default for StabilizerConfig {
     fn default() -> Self {
         Self {
-            dwell: Duration::from_millis(350),
-            loss_timeout: Duration::from_millis(600),
-            smoothing_alpha: 0.35,
+            dwell: Duration::from_millis(550),
+            loss_timeout: Duration::from_millis(900),
+            switch_cooldown: Duration::from_millis(1_200),
+            minimum_confidence: 0.50,
+            smoothing_alpha: 0.28,
         }
     }
 }
@@ -26,6 +30,7 @@ pub struct TargetStabilizer {
     candidate: Option<(GazeTarget, Instant)>,
     active: Option<(GazeTarget, Instant)>,
     last_seen: Option<Instant>,
+    last_switch: Option<Instant>,
 }
 
 impl TargetStabilizer {
@@ -36,11 +41,14 @@ impl TargetStabilizer {
             candidate: None,
             active: None,
             last_seen: None,
+            last_switch: None,
         }
     }
 
     pub fn update(&mut self, target: Option<GazeTarget>, now: Instant) -> Option<StabilizedTarget> {
-        let Some(target) = target else {
+        let Some(target) =
+            target.filter(|target| target.confidence >= self.config.minimum_confidence)
+        else {
             if self
                 .last_seen
                 .is_some_and(|seen| now.saturating_duration_since(seen) >= self.config.loss_timeout)
@@ -65,12 +73,22 @@ impl TargetStabilizer {
             .active
             .as_ref()
             .is_none_or(|(active, _)| !same_surface(active, candidate));
+        if changed
+            && self.last_switch.is_some_and(|last_switch| {
+                now.saturating_duration_since(last_switch) < self.config.switch_cooldown
+            })
+        {
+            return self.current(now, false);
+        }
         let activated_at = if changed {
             now
         } else {
             self.active.as_ref().expect("active target").1
         };
         self.active = Some((candidate.clone(), activated_at));
+        if changed {
+            self.last_switch = Some(now);
+        }
         self.current(now, changed)
     }
 
@@ -78,6 +96,7 @@ impl TargetStabilizer {
         self.candidate = None;
         self.active = None;
         self.last_seen = None;
+        self.last_switch = None;
     }
 
     fn current(&self, now: Instant, changed: bool) -> Option<StabilizedTarget> {
@@ -133,14 +152,49 @@ mod tests {
         let mut filter = TargetStabilizer::new(StabilizerConfig::default());
         assert!(filter.update(Some(target("a")), started).is_none());
         let active = filter
-            .update(Some(target("a")), started + Duration::from_millis(400))
+            .update(Some(target("a")), started + Duration::from_millis(600))
             .unwrap();
         assert!(active.changed);
         assert_eq!(active.target.display_id, "a");
         let held = filter
-            .update(Some(target("b")), started + Duration::from_millis(410))
+            .update(Some(target("b")), started + Duration::from_millis(610))
             .unwrap();
         assert!(!held.changed);
         assert_eq!(held.target.display_id, "a");
+    }
+
+    #[test]
+    fn rejects_low_confidence_targets_without_dropping_the_active_surface() {
+        let started = Instant::now();
+        let mut filter = TargetStabilizer::new(StabilizerConfig::default());
+        filter.update(Some(target("a")), started);
+        let active = filter
+            .update(Some(target("a")), started + Duration::from_millis(600))
+            .unwrap();
+        assert_eq!(active.target.display_id, "a");
+        let mut uncertain = target("b");
+        uncertain.confidence = 0.2;
+        let held = filter
+            .update(Some(uncertain), started + Duration::from_millis(700))
+            .unwrap();
+        assert_eq!(held.target.display_id, "a");
+    }
+
+    #[test]
+    fn switches_after_both_dwell_and_cooldown_have_elapsed() {
+        let started = Instant::now();
+        let mut filter = TargetStabilizer::new(StabilizerConfig::default());
+        filter.update(Some(target("a")), started);
+        filter.update(Some(target("a")), started + Duration::from_millis(600));
+        filter.update(Some(target("b")), started + Duration::from_millis(700));
+        let held = filter
+            .update(Some(target("b")), started + Duration::from_millis(1_300))
+            .unwrap();
+        assert_eq!(held.target.display_id, "a");
+        let switched = filter
+            .update(Some(target("b")), started + Duration::from_millis(1_801))
+            .unwrap();
+        assert!(switched.changed);
+        assert_eq!(switched.target.display_id, "b");
     }
 }

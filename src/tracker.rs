@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
 use crate::observation_filter::ObservationFilter;
-use crate::presence::{classify_presence, PresenceEnrollment, PresenceStabilizer};
+use crate::presence::{
+    classify_presence, PresenceEnrollment, PresenceStabilizer, PRESENCE_ENROLLMENT_REQUIRED_SAMPLES,
+};
 use crate::{Error, ModelBundle};
 use crate::{
     GazeEngine, ObservationFilterConfig, PresenceEnrollmentStatus, PresenceProfile, Result,
@@ -284,7 +286,16 @@ impl GazeTracker {
                                 let mut enrollment = presence_enrollment.lock();
                                 enrollment
                                     .as_mut()
-                                    .map(|enrollment| enrollment.push(frame_inference.face_count, &frame_inference.embeddings))
+                                    .map(|enrollment| {
+                                        enrollment.push(
+                                            frame_inference.face_count,
+                                            &frame_inference.embeddings,
+                                            observation
+                                                .as_ref()
+                                                .expect("enrollment quality checked")
+                                                .head_pose,
+                                        )
+                                    })
                                     .transpose()
                             };
                             match completed {
@@ -305,6 +316,7 @@ impl GazeTracker {
                                 presence_profile.read().as_ref(),
                                 frame_inference.face_count,
                                 &frame_inference.embeddings,
+                                observation.as_ref().map(|observation| observation.head_pose),
                             )
                         } else {
                             Default::default()
@@ -315,7 +327,7 @@ impl GazeTracker {
                             .as_ref()
                             .map(PresenceEnrollment::status)
                             .unwrap_or_else(|| PresenceEnrollmentStatus {
-                                required_samples: 12,
+                                required_samples: PRESENCE_ENROLLMENT_REQUIRED_SAMPLES,
                                 ..PresenceEnrollmentStatus::default()
                             });
                         snapshot.inferred_frames = snapshot.inferred_frames.saturating_add(1);

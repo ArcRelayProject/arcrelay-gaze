@@ -122,6 +122,9 @@ impl WorkspaceMapper {
         else {
             return Ok(None);
         };
+        if region_confidence < 0.35 {
+            return Ok(None);
+        }
         let display = self
             .layout
             .displays
@@ -133,8 +136,26 @@ impl WorkspaceMapper {
                     region.display_id
                 ))
             })?;
-        let point = display_center(display);
+        let eye_point = (self.profile.eye_sample_count.unwrap_or(0) >= 9
+            && observation.usable_for_targeting())
+        .then(|| self.profile.project_with_source(observation))
+        .transpose()?
+        .and_then(|(point, source)| (source == ProjectionSource::Eye).then_some(point));
+        let (point, source) = eye_point
+            .map(|point| (clamp_to_display(display, point), TargetingSource::Eye))
+            .unwrap_or_else(|| (display_center(display), TargetingSource::HeadFallback));
         let logical = display.logical_point_from_desk(point);
+        let calibration_quality = if source == TargetingSource::Eye {
+            (1.0 / (1.0 + self.profile.rms_error_um / 80_000.0)) as f32
+        } else {
+            0.7
+        };
+        // Region classification already rejects ambiguous and out-of-distribution
+        // observations. Blend the remaining evidence instead of multiplying it,
+        // which would make normal calibration error suppress every valid target.
+        let confidence = 0.62 * region_confidence
+            + 0.23 * observation.face_confidence
+            + 0.15 * calibration_quality;
         Ok(Some(GazeTarget {
             device_id: display.device_id.to_string(),
             display_id: display.display_id.to_string(),
@@ -142,8 +163,8 @@ impl WorkspaceMapper {
             desk_y_um: point.y,
             logical_x: logical.x,
             logical_y: logical.y,
-            confidence: (observation.face_confidence * region_confidence).clamp(0.0, 0.85),
-            source: TargetingSource::HeadFallback,
+            confidence: confidence.clamp(0.0, 0.92),
+            source,
         }))
     }
 }
@@ -166,6 +187,22 @@ fn display_center(display: &DisplaySurface) -> DeskPointUm {
             .desk_rect_um
             .y
             .saturating_add(display.desk_rect_um.height / 2),
+    }
+}
+
+fn clamp_to_display(display: &DisplaySurface, point: DeskPointUm) -> DeskPointUm {
+    let rect = display.desk_rect_um;
+    let margin_x = (rect.width / 50).max(1);
+    let margin_y = (rect.height / 50).max(1);
+    DeskPointUm {
+        x: point.x.clamp(
+            rect.x.saturating_add(margin_x),
+            rect.x.saturating_add(rect.width).saturating_sub(margin_x),
+        ),
+        y: point.y.clamp(
+            rect.y.saturating_add(margin_y),
+            rect.y.saturating_add(rect.height).saturating_sub(margin_y),
+        ),
     }
 }
 
@@ -319,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn head_region_profile_ignores_eye_gaze_and_selects_screen_center() {
+    fn head_only_region_profile_selects_screen_center() {
         let mut layout = layout();
         let mut right = layout.displays.values().next().unwrap().clone();
         right.display_id = DisplayId::parse("right-display").unwrap();
@@ -330,7 +367,7 @@ mod tests {
         right.desk_rect_um.x = 600_000;
         layout.displays.insert(right.display_id.clone(), right);
         let profile = CalibrationProfile {
-            version: 3,
+            version: 4,
             camera_id: "camera".into(),
             layout_signature: layout_signature(&layout),
             coefficients_x: [0.0; 8],
@@ -346,12 +383,18 @@ mod tests {
                     display_id: "local-display".into(),
                     centroid: [-0.48, 0.0, 0.48, 0.5, 0.19],
                     scale: [0.07, 0.07, 0.03, 0.03, 0.02],
+                    gaze_centroid: None,
+                    gaze_scale: None,
+                    acceptance_radius: 3.0,
                     sample_count: 9,
                 },
                 HeadRegionProfile {
                     display_id: "right-display".into(),
                     centroid: [0.52, 0.0, 0.48, 0.5, 0.19],
                     scale: [0.07, 0.07, 0.03, 0.03, 0.02],
+                    gaze_centroid: None,
+                    gaze_scale: None,
+                    acceptance_radius: 3.0,
                     sample_count: 9,
                 },
             ],
@@ -368,6 +411,65 @@ mod tests {
         assert_eq!(target.device_id, "right-device");
         assert!((target.logical_x - 2_880.0).abs() < 0.1);
         assert_eq!(target.source, TargetingSource::HeadFallback);
+    }
+
+    #[test]
+    fn fused_region_profile_uses_eye_regression_within_selected_screen() {
+        let mut layout = layout();
+        let mut right = layout.displays.values().next().unwrap().clone();
+        right.display_id = DisplayId::parse("right-display").unwrap();
+        right.device_id = ServiceInstanceId::parse("right-device").unwrap();
+        right.fingerprint = DisplayFingerprint::parse("panel-b").unwrap();
+        right.name = "Right".into();
+        right.logical_bounds.x = 1920.0;
+        right.desk_rect_um.x = 600_000;
+        layout.displays.insert(right.display_id.clone(), right);
+        let profile = CalibrationProfile {
+            version: 4,
+            camera_id: "camera".into(),
+            layout_signature: layout_signature(&layout),
+            coefficients_x: [900_000.0, 200_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            coefficients_y: [170_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            rms_error_um: 20_000.0,
+            sample_count: 90,
+            eye_sample_count: Some(90),
+            head_coefficients_x: None,
+            head_coefficients_y: None,
+            head_rms_error_um: None,
+            head_regions: vec![
+                HeadRegionProfile {
+                    display_id: "local-display".into(),
+                    centroid: [-0.48, 0.0, 0.48, 0.5, 0.19],
+                    scale: [0.07, 0.07, 0.03, 0.03, 0.02],
+                    gaze_centroid: Some([0.3, 0.0]),
+                    gaze_scale: Some([0.1, 0.1]),
+                    acceptance_radius: 3.0,
+                    sample_count: 45,
+                },
+                HeadRegionProfile {
+                    display_id: "right-display".into(),
+                    centroid: [0.56, 0.0, 0.48, 0.5, 0.19],
+                    scale: [0.07, 0.07, 0.03, 0.03, 0.02],
+                    gaze_centroid: Some([-0.3, 0.0]),
+                    gaze_scale: Some([0.1, 0.1]),
+                    acceptance_radius: 3.0,
+                    sample_count: 45,
+                },
+            ],
+        };
+        let mut observation = observation();
+        observation.head_pose.yaw = 42.0;
+        observation.gaze.x = -0.3;
+        let target = WorkspaceMapper::new(layout, profile)
+            .unwrap()
+            .map(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.display_id, "right-display");
+        assert_eq!(target.source, TargetingSource::Eye);
+        assert_eq!(target.desk_x_um, 840_000);
+        assert!((target.logical_x - 2_688.0).abs() < 0.1);
+        assert!(target.confidence >= 0.55);
     }
 
     #[test]

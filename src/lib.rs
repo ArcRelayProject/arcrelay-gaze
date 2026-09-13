@@ -25,8 +25,9 @@ pub use model_bundle::{ModelFile, OwnedModelBundle, MODEL_BUNDLE_VERSION, MODEL_
 pub use observation_filter::ObservationFilterConfig;
 pub use pipeline::{GazeEngine, ModelBundle};
 pub use presence::{
-    PresenceEnrollmentStatus, PresenceObservation, PresenceProfile, PresenceState,
-    FACE_EMBEDDING_DIMENSIONS, PRESENCE_PROFILE_VERSION,
+    PresenceEnrollmentStatus, PresenceObservation, PresencePose, PresencePoseTemplate,
+    PresenceProfile, PresenceState, FACE_EMBEDDING_DIMENSIONS,
+    PRESENCE_ENROLLMENT_REQUIRED_SAMPLES, PRESENCE_PROFILE_VERSION,
 };
 pub use smoothing::{StabilizerConfig, TargetStabilizer};
 #[cfg(feature = "camera")]

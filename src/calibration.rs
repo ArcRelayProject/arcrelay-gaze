@@ -8,14 +8,17 @@ use crate::{Error, GazeObservation, Result};
 const FEATURE_COUNT: usize = 8;
 const HEAD_FEATURE_COUNT: usize = 7;
 const HEAD_REGION_FEATURE_COUNT: usize = 5;
+const GAZE_REGION_FEATURE_COUNT: usize = 2;
 const MINIMUM_SAMPLES: usize = 9;
 const MINIMUM_REGION_SAMPLES: usize = 5;
+const MIN_REGION_SEPARATION: f64 = 0.16;
 
 #[derive(Clone, Debug)]
 struct HeadCalibrationSample {
     display_id: Option<String>,
     features: [f64; HEAD_FEATURE_COUNT],
     region_features: [f64; HEAD_REGION_FEATURE_COUNT],
+    gaze_features: Option<[f64; GAZE_REGION_FEATURE_COUNT]>,
     desk_x_um: i64,
     desk_y_um: i64,
 }
@@ -27,6 +30,12 @@ pub struct HeadRegionProfile {
     pub display_id: String,
     pub centroid: [f64; HEAD_REGION_FEATURE_COUNT],
     pub scale: [f64; HEAD_REGION_FEATURE_COUNT],
+    #[serde(default)]
+    pub gaze_centroid: Option<[f64; GAZE_REGION_FEATURE_COUNT]>,
+    #[serde(default)]
+    pub gaze_scale: Option<[f64; GAZE_REGION_FEATURE_COUNT]>,
+    #[serde(default = "default_acceptance_radius")]
+    pub acceptance_radius: f64,
     pub sample_count: usize,
 }
 
@@ -138,8 +147,11 @@ impl CalibrationProfile {
             return None;
         }
         let values = head_region_features(observation);
+        let gaze = observation
+            .usable_for_targeting()
+            .then(|| gaze_region_features(observation));
         let mut ranked = self.head_regions.iter().map(|region| {
-            let distance = region_distance(region, &values);
+            let distance = region_distance_from_features(region, values, gaze);
             (region, distance)
         });
         let (mut best_region, mut best_distance) = ranked.next()?;
@@ -158,8 +170,13 @@ impl CalibrationProfile {
         } else {
             1.0
         };
-        let proximity = 1.0 / (1.0 + best_distance * 0.22);
-        let confidence = (proximity * (0.55 + separation * 0.45)).clamp(0.15, 0.9) as f32;
+        if best_distance > best_region.acceptance_radius
+            || (second_distance.is_finite() && separation < MIN_REGION_SEPARATION)
+        {
+            return None;
+        }
+        let proximity = 1.0 - (best_distance / best_region.acceptance_radius).clamp(0.0, 1.0);
+        let confidence = (proximity * (0.45 + separation * 0.55)).clamp(0.0, 0.95) as f32;
         Some((best_region, confidence))
     }
 }
@@ -209,15 +226,17 @@ impl Calibrator {
                 "a confident face and usable head pose are required".into(),
             ));
         }
-        let region_calibration = display_id.is_some();
         self.head_samples.push(HeadCalibrationSample {
             display_id,
             features: head_features(observation),
             region_features: head_region_features(observation),
+            gaze_features: observation
+                .usable_for_targeting()
+                .then(|| gaze_region_features(observation)),
             desk_x_um: target.x,
             desk_y_um: target.y,
         });
-        if !region_calibration && observation.usable_for_targeting() {
+        if observation.usable_for_targeting() {
             self.samples
                 .push(CalibrationSample::from_observation(observation, target));
         }
@@ -255,7 +274,7 @@ impl Calibrator {
         );
         let rms_error_um = eye_rms_error_um.unwrap_or(head_rms_error_um);
         let head_regions = build_head_regions(&self.head_samples)?;
-        let version = if head_regions.is_empty() { 2 } else { 3 };
+        let version = if head_regions.is_empty() { 2 } else { 4 };
         Ok(CalibrationProfile {
             version,
             camera_id: self.camera_id,
@@ -321,6 +340,10 @@ fn head_region_features(observation: &GazeObservation) -> [f64; HEAD_REGION_FEAT
     ]
 }
 
+fn gaze_region_features(observation: &GazeObservation) -> [f64; GAZE_REGION_FEATURE_COUNT] {
+    [f64::from(observation.gaze.x), f64::from(observation.gaze.y)]
+}
+
 fn build_head_regions(samples: &[HeadCalibrationSample]) -> Result<Vec<HeadRegionProfile>> {
     let mut groups: BTreeMap<&str, Vec<&HeadCalibrationSample>> = BTreeMap::new();
     for sample in samples {
@@ -336,40 +359,65 @@ fn build_head_regions(samples: &[HeadCalibrationSample]) -> Result<Vec<HeadRegio
                 samples.len()
             )));
         }
-        let mut centroid = [0.0; HEAD_REGION_FEATURE_COUNT];
-        for sample in &samples {
-            for (index, value) in sample.region_features.iter().enumerate() {
-                centroid[index] += value;
-            }
-        }
-        for value in &mut centroid {
-            *value /= samples.len() as f64;
-        }
-        let mut scale = [0.0; HEAD_REGION_FEATURE_COUNT];
-        for sample in &samples {
-            for index in 0..HEAD_REGION_FEATURE_COUNT {
-                let delta = sample.region_features[index] - centroid[index];
-                scale[index] += delta * delta;
-            }
-        }
-        let floors = [0.055, 0.055, 0.025, 0.025, 0.012];
-        for index in 0..HEAD_REGION_FEATURE_COUNT {
-            scale[index] = (scale[index] / samples.len() as f64)
-                .sqrt()
-                .max(floors[index]);
-        }
-        regions.push(HeadRegionProfile {
+        let centroid = robust_center(&samples, |sample| sample.region_features);
+        // Position and apparent face size are deliberately broad nuisance
+        // features. They may help compensate camera parallax, but a normal
+        // seated translation must not be mistaken for a turn toward a screen.
+        let scale = robust_scale(
+            &samples,
+            |sample| sample.region_features,
+            &[0.06, 0.06, 0.085, 0.085, 0.035],
+            &centroid,
+        );
+        let gaze_samples = samples
+            .iter()
+            .filter_map(|sample| sample.gaze_features)
+            .collect::<Vec<_>>();
+        let (gaze_centroid, gaze_scale) = if gaze_samples.len() >= MINIMUM_REGION_SAMPLES {
+            let center = robust_array_center(&gaze_samples);
+            let scale = robust_array_scale(&gaze_samples, &[0.045, 0.045], &center);
+            (Some(center), Some(scale))
+        } else {
+            (None, None)
+        };
+        let provisional = HeadRegionProfile {
             display_id: display_id.to_owned(),
             centroid,
             scale,
+            gaze_centroid,
+            gaze_scale,
+            acceptance_radius: default_acceptance_radius(),
             sample_count: samples.len(),
+        };
+        let mut training_distances = samples
+            .iter()
+            .map(|sample| {
+                region_distance_from_features(
+                    &provisional,
+                    sample.region_features,
+                    sample.gaze_features,
+                )
+            })
+            .collect::<Vec<_>>();
+        training_distances.sort_by(f64::total_cmp);
+        let p90 = training_distances
+            .get((training_distances.len() * 9 / 10).min(training_distances.len() - 1))
+            .copied()
+            .unwrap_or(1.0);
+        regions.push(HeadRegionProfile {
+            acceptance_radius: (p90 * 2.2).clamp(1.8, 3.6),
+            ..provisional
         });
     }
     Ok(regions)
 }
 
-fn region_distance(region: &HeadRegionProfile, values: &[f64; HEAD_REGION_FEATURE_COUNT]) -> f64 {
-    const WEIGHTS: [f64; HEAD_REGION_FEATURE_COUNT] = [3.0, 3.0, 1.2, 1.2, 0.4];
+fn region_distance_from_features(
+    region: &HeadRegionProfile,
+    values: [f64; HEAD_REGION_FEATURE_COUNT],
+    gaze: Option<[f64; GAZE_REGION_FEATURE_COUNT]>,
+) -> f64 {
+    const WEIGHTS: [f64; HEAD_REGION_FEATURE_COUNT] = [3.0, 3.0, 0.25, 0.25, 0.1];
     let weighted = values
         .iter()
         .zip(region.centroid)
@@ -380,7 +428,74 @@ fn region_distance(region: &HeadRegionProfile, values: &[f64; HEAD_REGION_FEATUR
             normalized * normalized * weight
         })
         .sum::<f64>();
-    (weighted / WEIGHTS.iter().sum::<f64>()).sqrt()
+    let mut weight_sum = WEIGHTS.iter().sum::<f64>();
+    let mut total = weighted;
+    if let (Some(gaze), Some(center), Some(scale)) = (gaze, region.gaze_centroid, region.gaze_scale)
+    {
+        const GAZE_WEIGHTS: [f64; GAZE_REGION_FEATURE_COUNT] = [1.7, 1.7];
+        for index in 0..GAZE_REGION_FEATURE_COUNT {
+            let normalized = (gaze[index] - center[index]) / scale[index].max(1e-6);
+            total += normalized * normalized * GAZE_WEIGHTS[index];
+            weight_sum += GAZE_WEIGHTS[index];
+        }
+    }
+    (total / weight_sum).sqrt()
+}
+
+fn default_acceptance_radius() -> f64 {
+    2.6
+}
+
+fn robust_center<const N: usize, T>(samples: &[&T], values: impl Fn(&T) -> [f64; N]) -> [f64; N] {
+    robust_array_center(
+        &samples
+            .iter()
+            .map(|sample| values(sample))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn robust_scale<const N: usize, T>(
+    samples: &[&T],
+    values: impl Fn(&T) -> [f64; N],
+    floors: &[f64; N],
+    center: &[f64; N],
+) -> [f64; N] {
+    robust_array_scale(
+        &samples
+            .iter()
+            .map(|sample| values(sample))
+            .collect::<Vec<_>>(),
+        floors,
+        center,
+    )
+}
+
+fn robust_array_center<const N: usize>(samples: &[[f64; N]]) -> [f64; N] {
+    std::array::from_fn(|index| {
+        let mut values = samples
+            .iter()
+            .map(|sample| sample[index])
+            .collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    })
+}
+
+fn robust_array_scale<const N: usize>(
+    samples: &[[f64; N]],
+    floors: &[f64; N],
+    center: &[f64; N],
+) -> [f64; N] {
+    std::array::from_fn(|index| {
+        let mut deviations = samples
+            .iter()
+            .map(|sample| (sample[index] - center[index]).abs())
+            .collect::<Vec<_>>();
+        deviations.sort_by(f64::total_cmp);
+        // 1.4826 turns median absolute deviation into a robust sigma.
+        (deviations[deviations.len() / 2] * 1.4826).max(floors[index])
+    })
 }
 
 fn fit(
@@ -538,6 +653,7 @@ mod tests {
                 display_id: None,
                 features: sample.features[..HEAD_FEATURE_COUNT].try_into().unwrap(),
                 region_features: [0.0; HEAD_REGION_FEATURE_COUNT],
+                gaze_features: None,
                 desk_x_um: sample.desk_x_um,
                 desk_y_um: sample.desk_y_um,
             })
@@ -654,9 +770,9 @@ mod tests {
             }
         }
         let profile = calibrator.finish().expect("fit display regions");
-        assert_eq!(profile.version, 3);
+        assert_eq!(profile.version, 4);
         assert_eq!(profile.head_regions.len(), 2);
-        assert_eq!(profile.eye_sample_count, Some(0));
+        assert_eq!(profile.eye_sample_count, Some(18));
         let mut right = GazeObservation {
             frame_width: 1280,
             frame_height: 720,
@@ -689,5 +805,16 @@ mod tests {
             .classify_head_region(&right)
             .expect("classify left display");
         assert_eq!(region.display_id, "left-display");
+
+        right.head_pose.yaw = 0.0;
+        assert!(
+            profile.classify_head_region(&right).is_none(),
+            "an observation on the boundary must be rejected instead of guessed"
+        );
+        right.head_pose.pitch = 55.0;
+        assert!(
+            profile.classify_head_region(&right).is_none(),
+            "an out-of-distribution posture must be rejected"
+        );
     }
 }
