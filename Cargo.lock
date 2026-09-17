@@ -260,7 +260,7 @@ dependencies = [
 [[package]]
 name = "arcrelay-input"
 version = "0.1.0"
-source = "git+https://github.com/ArcRelayProject/arcrelay-input.git?rev=1114b32ec72c0e9ce93fca61e6d215c173f54e9d#1114b32ec72c0e9ce93fca61e6d215c173f54e9d"
+source = "git+https://github.com/ArcRelayProject/arcrelay-input.git?rev=63ece7b899e1854ee38b94d8c6f062efdbf23fbb#63ece7b899e1854ee38b94d8c6f062efdbf23fbb"
 dependencies = [
  "arc-swap",
  "arcrelay-peer",
@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "arcrelay-peer"
 version = "0.1.0"
-source = "git+https://github.com/ArcRelayProject/arcrelay-peer.git?rev=739e41c49020cf19f0d490c64143e68e995aef83#739e41c49020cf19f0d490c64143e68e995aef83"
+source = "git+https://github.com/ArcRelayProject/arcrelay-peer.git?rev=48cd4ad8538a0b5add33877f7f9b295e78c4fce1#48cd4ad8538a0b5add33877f7f9b295e78c4fce1"
 dependencies = [
  "async-trait",
  "data-encoding",
@@ -292,7 +292,7 @@ dependencies = [
 [[package]]
 name = "arcrelay-transport"
 version = "0.1.0"
-source = "git+https://github.com/ArcRelayProject/arcrelay-transport.git?rev=16305821fea3778e3fc544f0e57eb3b5b51fec11#16305821fea3778e3fc544f0e57eb3b5b51fec11"
+source = "git+https://github.com/ArcRelayProject/arcrelay-transport.git?rev=968a954c753b567d51fb17aa00c3c508af80250b#968a954c753b567d51fb17aa00c3c508af80250b"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
