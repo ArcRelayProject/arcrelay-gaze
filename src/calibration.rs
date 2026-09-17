@@ -506,10 +506,10 @@ fn fit(
     let mut rhs = [0.0; FEATURE_COUNT];
     for sample in samples {
         let y = target(sample);
-        for row in 0..FEATURE_COUNT {
+        for (row, coefficients) in matrix.iter_mut().enumerate() {
             rhs[row] += sample.features[row] * y;
-            for column in 0..FEATURE_COUNT {
-                matrix[row][column] += sample.features[row] * sample.features[column];
+            for (coefficient, feature) in coefficients.iter_mut().zip(&sample.features) {
+                *coefficient += sample.features[row] * feature;
             }
         }
     }
@@ -598,17 +598,20 @@ fn solve<const N: usize>(mut matrix: [[f64; N]; N], mut rhs: [f64; N]) -> Result
         matrix.swap(pivot, best);
         rhs.swap(pivot, best);
         let scale = matrix[pivot][pivot];
-        for column in pivot..N {
-            matrix[pivot][column] /= scale;
+        for coefficient in &mut matrix[pivot][pivot..] {
+            *coefficient /= scale;
         }
         rhs[pivot] /= scale;
-        for row in 0..N {
+        let pivot_row = matrix[pivot];
+        for (row, coefficients) in matrix.iter_mut().enumerate() {
             if row == pivot {
                 continue;
             }
-            let factor = matrix[row][pivot];
-            for column in pivot..N {
-                matrix[row][column] -= factor * matrix[pivot][column];
+            let factor = coefficients[pivot];
+            for (coefficient, pivot_coefficient) in
+                coefficients[pivot..].iter_mut().zip(&pivot_row[pivot..])
+            {
+                *coefficient -= factor * pivot_coefficient;
             }
             rhs[row] -= factor * rhs[pivot];
         }

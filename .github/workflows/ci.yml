@@ -18,6 +18,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt -- --check
       - run: cargo check --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib
       - name: Verify trusted maintainer policy
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'

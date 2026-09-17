@@ -365,7 +365,9 @@ impl GazeEngine {
             )));
         }
         Ok(landmarks_raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|xy| Point {
                 x: face.x + xy[0] * face.width,
                 y: face.y + xy[1] * face.height,

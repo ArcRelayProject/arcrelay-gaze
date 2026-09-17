@@ -215,8 +215,9 @@ impl GazeTracker {
         let events = event_tx.clone();
         let task = tokio::spawn(async move {
             let mut converter = RgbConverter::new();
+            let mut rgb_buffer = Vec::new();
             let mut observation_filter = ObservationFilter::new(config.observation_filter.clone());
-            let mut stabilizer = TargetStabilizer::new(config.stabilizer.clone());
+            let mut stabilizer = TargetStabilizer::new(config.stabilizer);
             let mut presence_stabilizer = PresenceStabilizer::new(Instant::now());
             let mut last_inference = None;
             let mut last_detection = None;
@@ -255,61 +256,47 @@ impl GazeTracker {
                             continue;
                         }
                         last_inference = Some(now);
-                        let layout = frame.layout();
-                        let conversion = ConversionRequest::for_layout(layout);
-                        let mut pixels = match conversion.output_len() {
-                            Ok(length) => vec![0; length],
-                            Err(error) => {
-                                snapshot.state = TrackingState::Failed;
-                                snapshot.error = Some(error.to_string());
-                                snapshot_tx.send_replace(snapshot.clone());
-                                break;
-                            }
-                        };
-                        if let Err(error) = converter.convert_into(&frame, conversion, &mut pixels) {
-                            snapshot.state = TrackingState::Failed;
-                            snapshot.error = Some(error.to_string());
-                            snapshot_tx.send_replace(snapshot.clone());
-                            break;
-                        }
-                        let preview = (config.include_preview
-                            || preview_enabled.load(Ordering::Acquire))
-                            .then(|| Arc::<[u8]>::from(pixels.clone()));
-                        let Some(image) = RgbImage::from_raw(layout.width, layout.height, pixels) else {
-                            snapshot.state = TrackingState::Failed;
-                            snapshot.error = Some("camera returned an invalid RGB frame".into());
-                            snapshot_tx.send_replace(snapshot.clone());
-                            continue;
-                        };
-                        let luma = sampled_luma(&image);
-                        let scene_changed = previous_luma
-                            .as_deref()
-                            .is_some_and(|previous| luma_changed(previous, &luma));
-                        previous_luma = Some(luma);
-                        let enrollment_active = presence_enrollment.lock().is_some();
+                        let include_preview = config.include_preview || preview_enabled.load(Ordering::Acquire);
+                        let prior_luma = previous_luma.take();
                         let detection_due = snapshot.observation.is_none()
-                            || scene_changed
-                            || last_detection.is_none_or(|last: Instant| {
-                                now.saturating_duration_since(last)
-                                    >= config.face_detection_interval
-                            });
-                        let identity_due = config.presence_enabled
-                            && (enrollment_active
-                                || scene_changed
-                                || cached_identity.is_none()
-                                || last_identity.is_none_or(|last: Instant| {
-                                    now.saturating_duration_since(last)
-                                        >= config.presence_recheck_interval
-                                }));
+                            || last_detection.is_none_or(|last: Instant| now.saturating_duration_since(last) >= config.face_detection_interval);
+                        let identity_due = presence_enrollment.lock().is_some() || cached_identity.is_none()
+                            || last_identity.is_none_or(|last: Instant| now.saturating_duration_since(last) >= config.presence_recheck_interval);
+                        let identity_tracking = config.presence_enabled;
                         let inference_engine = engine.clone();
-                        let plan = InferencePlan {
-                            detect_faces: detection_due,
-                            estimate_gaze: true,
-                            identity_tracking: config.presence_enabled,
-                            extract_identity: identity_due,
-                        };
-                        let frame_inference = match tokio::task::spawn_blocking(move || inference_engine.infer_planned(&image, plan)).await {
-                            Ok(Ok(observation)) => observation,
+                        let frame_width = frame.layout().width;
+                        let frame_height = frame.layout().height;
+                        // There is one outstanding worker per session. Converter
+                        // state and its RGB allocation return for the next frame.
+                        let work = tokio::task::spawn_blocking(move || -> Result<_> {
+                            let conversion_started = Instant::now();
+                            let layout = frame.layout();
+                            let conversion = ConversionRequest::for_layout(layout);
+                            let length = conversion.output_len()?;
+                            if length > 32 * 1024 * 1024 {
+                                return Err(Error::InvalidConfig("camera RGB frame exceeds the conversion budget".into()));
+                            }
+                            rgb_buffer.resize(length, 0);
+                            converter.convert_into(&frame, conversion, &mut rgb_buffer)?;
+                            let image = RgbImage::from_raw(layout.width, layout.height, rgb_buffer)
+                                .ok_or_else(|| Error::Worker("camera returned an invalid RGB frame".into()))?;
+                            let luma = sampled_luma(&image);
+                            let scene_changed = prior_luma.as_deref().is_some_and(|previous| luma_changed(previous, &luma));
+                            let conversion_us = conversion_started.elapsed().as_micros() as u64;
+                            let inference_started = Instant::now();
+                            let inference = inference_engine.infer_planned(&image, InferencePlan {
+                                detect_faces: detection_due || scene_changed,
+                                estimate_gaze: true,
+                                identity_tracking,
+                                extract_identity: identity_tracking && (identity_due || scene_changed),
+                            })?;
+                            let inference_us = inference_started.elapsed().as_micros() as u64;
+                            let preview = include_preview.then(|| Arc::<[u8]>::from(image.as_raw().as_slice()));
+                            tracing::trace!(event = "gaze.frame.processed", conversion_us, inference_us, rgb_bytes = length, preview = include_preview);
+                            Ok((converter, image.into_raw(), luma, inference, preview))
+                        }).await;
+                        let (returned_converter, pixels, luma, frame_inference, preview) = match work {
+                            Ok(Ok(result)) => result,
                             Ok(Err(error)) => {
                                 snapshot.state = TrackingState::Failed;
                                 snapshot.error = Some(error.to_string());
@@ -323,6 +310,9 @@ impl GazeTracker {
                                 break;
                             }
                         };
+                        converter = returned_converter;
+                        rgb_buffer = pixels;
+                        previous_luma = Some(luma);
                         if frame_inference.detection_ran {
                             last_detection = Some(now);
                             snapshot.detected_frames = snapshot.detected_frames.saturating_add(1);
@@ -409,8 +399,8 @@ impl GazeTracker {
                             });
                         snapshot.inferred_frames = snapshot.inferred_frames.saturating_add(1);
                         snapshot.dropped_frames = receiver.dropped_frames();
-                        snapshot.frame_width = layout.width;
-                        snapshot.frame_height = layout.height;
+                        snapshot.frame_width = frame_width;
+                        snapshot.frame_height = frame_height;
                         snapshot.error = None;
                         snapshot.observation = observation.clone();
                         let mapped = observation
